@@ -1,0 +1,19 @@
+{
+  "name": "mini-claude-code",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "mini": "tsx --env-file-if-exists=.env index.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.68.0",
+    "@modelcontextprotocol/sdk": "^1.21.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}
