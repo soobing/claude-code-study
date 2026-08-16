@@ -1,0 +1,30 @@
+{
+  "name": "tool-using-agent-practice",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "ring1": "node --env-file=.env --import tsx ring1.ts",
+    "ring2": "node --env-file=.env --import tsx ring2.ts",
+    "ring3": "node --env-file=.env --import tsx ring3.ts",
+    "ring4": "node --env-file=.env --import tsx ring4.ts",
+    "ring5": "node --env-file=.env --import tsx ring5.ts",
+    "mini": "node --env-file=.env --import tsx mini-claude-code.ts",
+    "probe-mcp": "tsx probe-mcp.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.115.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.2",
+    "tsx": "^4.23.10",
+    "typescript": "^7.0.2"
+  }
+}
