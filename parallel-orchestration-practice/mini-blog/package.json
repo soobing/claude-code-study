@@ -1,0 +1,11 @@
+{
+  "name": "mini-blog",
+  "version": "0.1.0",
+  "description": "병렬 오케스트레이션 실습용 샘플 코드베이스 (일부러 흠집을 심어둠)",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test tests/"
+  },
+  "license": "MIT"
+}
