@@ -519,46 +519,63 @@ function buildGitStatusBlock(): string | null {
   }
 }
 
+type StartupSection = {
+  label: string;
+  system?: string | null; // system 프롬프트에 텍스트로 누적되는 부분
+  toolsAdd?: Anthropic.Tool[]; // tools 배열에 스키마로 누적되는 부분
+};
+
 async function buildSystemPromptWithBreakdown(): Promise<string> {
   const skillsBlock = `<available_skills>\n${skillCatalog}\n</available_skills>\n관련 작업을 할 때는 Skill 도구로 해당 문서를 먼저 읽으세요.`;
 
-  const sections: Array<{ label: string; text: string | null }> = [
-    { label: "시스템 프롬프트", text: SYSTEM_BASE },
-    { label: "Auto memory (MEMORY.md)", text: loadAutoMemory() },
-    { label: "환경 정보", text: buildEnvironmentInfo() },
-    { label: "MCP 도구 이름 (지연)", text: buildMcpToolNamesBlock() },
-    { label: "Skill 설명", text: skillsBlock },
-    { label: "전역 CLAUDE.md", text: loadFileBlock(path.join(os.homedir(), ".claude", "CLAUDE.md"), "global_claude_md") },
-    { label: "프로젝트 CLAUDE.md", text: loadFileBlock(path.join(WORKDIR, "CLAUDE.md"), "project_claude_md") },
-    { label: "Git 상태 (맨 끝 블록)", text: buildGitStatusBlock() },
+  // ★ system 텍스트와 tools(도구 스키마)는 API 요청에서 서로 다른 필드다.
+  //   둘 다 컨텍스트를 차지하지만, 원인을 구분하려면 회계도 따로 해야 한다.
+  //   (이전 버전은 tools를 매 호출마다 고정으로 끼워 넣어서, 그 고정비가
+  //    전부 맨 처음 측정되는 섹션 — "시스템 프롬프트" — 로 잘못 잡혔었다.)
+  const sections: StartupSection[] = [
+    { label: "시스템 프롬프트 (지시문)", system: SYSTEM_BASE },
+    { label: "도구 정의 (built-in 7개 스키마)", toolsAdd: builtinTools },
+    { label: "Auto memory (MEMORY.md)", system: loadAutoMemory() },
+    { label: "환경 정보", system: buildEnvironmentInfo() },
+    { label: "MCP 도구 이름 (지연, 텍스트만)", system: buildMcpToolNamesBlock() },
+    { label: "MCP 도구 스키마 (미니 구현 한계: 이미 로드됨)", toolsAdd: mcpTools },
+    { label: "Skill 설명", system: skillsBlock },
+    { label: "전역 CLAUDE.md", system: loadFileBlock(path.join(os.homedir(), ".claude", "CLAUDE.md"), "global_claude_md") },
+    { label: "프로젝트 CLAUDE.md", system: loadFileBlock(path.join(WORKDIR, "CLAUDE.md"), "project_claude_md") },
+    { label: "Git 상태 (맨 끝 블록)", system: buildGitStatusBlock() },
   ];
 
   console.log("\n📦 세션 시작 전 로드되는 컨텍스트 (countTokens API로 실측)");
-  console.log("─".repeat(58));
+  console.log("─".repeat(62));
 
-  let cumulative = "";
+  let cumulativeSystem = "";
+  let cumulativeTools: Anthropic.Tool[] = [];
   let prevTokens = 0;
   for (const s of sections) {
-    if (s.text === null) {
-      console.log(`  ${s.label.padEnd(26)}  (없음 — 스킵)`);
+    const hasSystem = !!s.system;
+    const hasTools = !!s.toolsAdd && s.toolsAdd.length > 0;
+    if (!hasSystem && !hasTools) {
+      console.log(`  ${s.label.padEnd(30)}  (없음 — 스킵)`);
       continue;
     }
-    cumulative += (cumulative ? "\n\n" : "") + s.text;
+    if (hasSystem) cumulativeSystem += (cumulativeSystem ? "\n\n" : "") + s.system;
+    if (hasTools) cumulativeTools = [...cumulativeTools, ...s.toolsAdd!];
+
     const counted = await client.messages.countTokens({
       model: MODEL,
-      system: cumulative,
-      tools,
+      system: cumulativeSystem || undefined,
+      tools: cumulativeTools.length ? cumulativeTools : undefined,
       messages: [{ role: "user", content: "." }],
     });
     const marginal = counted.input_tokens - prevTokens;
     prevTokens = counted.input_tokens;
-    console.log(`  ${s.label.padEnd(26)} +${String(marginal).padStart(5)} tokens`);
+    console.log(`  ${s.label.padEnd(30)} +${String(marginal).padStart(5)} tokens`);
   }
 
-  console.log("─".repeat(58));
-  console.log(`  ${"합계 (첫 프롬프트 이전)".padEnd(26)} ${String(prevTokens).padStart(6)} tokens\n`);
+  console.log("─".repeat(62));
+  console.log(`  ${"합계 (첫 프롬프트 이전)".padEnd(30)} ${String(prevTokens).padStart(6)} tokens\n`);
 
-  return cumulative;
+  return cumulativeSystem;
 }
 
 // ════════════════════════════════════════════════════════════════════
