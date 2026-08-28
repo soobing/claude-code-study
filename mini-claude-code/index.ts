@@ -14,6 +14,7 @@
 //   ⑨ 인터럽트       Esc
 //   ⑩ 컨텍스트 초기 로드  타이핑 전에 이미 쌓이는 것들 + 실측 토큰 브레이크다운
 //   ⑪ tool search    MCP 스키마를 이름만 노출하고 실제 필요할 때 지연 로드
+//   ⑫ 압축 후 skill 재주입  설명 목록은 사라지고, 호출했던 스킬 본문만 캡 걸고 재주입
 //
 // 실행:  npm run mini -- "src 구조 보고 README 만들어줘"
 //        USE_MCP=1 npm run mini -- "지금 몇 시야?"                     (기본값 = 지연 로드)
@@ -80,6 +81,10 @@ const SKILLS: Record<string, { description: string; body: string }> = {
 const skillCatalog = Object.entries(SKILLS)
   .map(([name, s]) => `- ${name}: ${s.description}`)
   .join("\n");
+
+// 초기 시스템 프롬프트에 들어가는 "설명 목록" 블록. ⑫에서 압축 후 이 블록을
+// 통째로 제거하기 위해 정확히 같은 문자열을 재사용할 수 있도록 모듈 상수로 뺐다.
+const skillCatalogBlock = `<available_skills>\n${skillCatalog}\n</available_skills>\n관련 작업을 할 때는 Skill 도구로 해당 문서를 먼저 읽으세요.`;
 
 // ════════════════════════════════════════════════════════════════════
 // ① 도구 정의 — 내장 도구 + Skill + Agent(subagent)
@@ -336,6 +341,7 @@ async function runTool(name: string, input: any, depth: number): Promise<string>
     case "Skill": {
       const skill = SKILLS[input.name];
       if (!skill) throw new Error(`그런 skill이 없습니다: ${input.name}`);
+      recordSkillInvocation(input.name); // ⑫ 압축 후 재주입 대상으로 기록
       console.log(`   [skill] ${input.name} 본문 로드 (${skill.body.length}자)`);
       return skill.body;
     }
@@ -424,6 +430,85 @@ async function compact(messages: Anthropic.MessageParam[]): Promise<Anthropic.Me
     },
     ...recent,
   ];
+}
+
+// ════════════════════════════════════════════════════════════════════
+// ⑫ 압축 후 skill 재주입 — /compact가 지나가면 skillCatalogBlock(설명
+//    목록)은 사라진다. 대신 "이번 세션에서 실제로 호출했던 스킬"의
+//    본문만 캡을 걸고 다시 주입한다:
+//      - 스킬당 최대 5,000토큰 (초과분은 잘라내되 파일 시작 부분을 유지)
+//      - 전체 합계 최대 25,000토큰 (초과하면 가장 오래 호출된 것부터 제외)
+//    ★ CLAUDE.md / auto memory / 환경 정보는 애초에 messages가 아니라
+//      systemPrompt 문자열 자체에 박혀있어서 compact()가 손대지 않는 한
+//      저절로 유지된다 — 그래서 "skill 설명 목록"만 별도 처리가 필요하다.
+// ════════════════════════════════════════════════════════════════════
+const invokedSkillOrder: string[] = []; // 호출 순서 (오래된 것 먼저)
+const PER_SKILL_CHAR_CAP = 5_000 * 4; // 5,000 토큰 ≈ 20,000자 근사치 (문자 기반 어림)
+const TOTAL_SKILL_TOKEN_CAP = 25_000;
+
+function recordSkillInvocation(name: string) {
+  if (!invokedSkillOrder.includes(name)) invokedSkillOrder.push(name);
+}
+
+async function buildInvokedSkillsBlock(): Promise<string | null> {
+  if (invokedSkillOrder.length === 0) return null;
+
+  let names = [...invokedSkillOrder];
+  while (names.length > 0) {
+    const block = names
+      .map((name) => {
+        const body = SKILLS[name].body;
+        // 잘림은 파일의 시작 부분을 유지한다 (문서 규칙)
+        const capped = body.length > PER_SKILL_CHAR_CAP ? body.slice(0, PER_SKILL_CHAR_CAP) : body;
+        return `<skill name="${name}">\n${capped}\n</skill>`;
+      })
+      .join("\n\n");
+
+    const counted = await client.messages.countTokens({
+      model: MODEL,
+      system: block,
+      messages: [{ role: "user", content: "." }],
+    });
+
+    if (counted.input_tokens <= TOTAL_SKILL_TOKEN_CAP) {
+      return `<reinjected_skills>\n${block}\n</reinjected_skills>`;
+    }
+    console.log(`   [compact] 스킬 재주입 예산(${TOTAL_SKILL_TOKEN_CAP.toLocaleString()}토큰) 초과 — 가장 오래된 "${names[0]}" 제외`);
+    names = names.slice(1); // 가장 오래된 것부터 제거
+  }
+  return null; // 다 빼도 예산을 못 맞추면(사실상 없음) 아무것도 재주입 안 함
+}
+
+async function rebuildSystemPromptAfterCompact(currentSystemPrompt: string): Promise<string> {
+  // skillCatalogBlock(설명 목록)을 통째로 제거 — 압축 후엔 이게 다시 안 들어간다.
+  const withoutCatalog = currentSystemPrompt
+    .replace(skillCatalogBlock, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+  const invokedBlock = await buildInvokedSkillsBlock();
+  const rebuilt = invokedBlock ? `${withoutCatalog}\n\n${invokedBlock}` : withoutCatalog;
+
+  const [before, after] = await Promise.all([
+    client.messages.countTokens({
+      model: MODEL,
+      system: currentSystemPrompt,
+      tools: activeTools,
+      messages: [{ role: "user", content: "." }],
+    }),
+    client.messages.countTokens({
+      model: MODEL,
+      system: rebuilt,
+      tools: activeTools,
+      messages: [{ role: "user", content: "." }],
+    }),
+  ]);
+  console.log(
+    `   [compact] 시스템 프롬프트 재구성 — skill 설명 목록 제거, 호출된 스킬 ${invokedSkillOrder.length}개 재주입 ` +
+      `(${before.input_tokens.toLocaleString()} → ${after.input_tokens.toLocaleString()} 토큰)`,
+  );
+
+  return rebuilt;
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -520,6 +605,7 @@ async function runLoop(
 
     if (depth === 0 && used > COMPACT_THRESHOLD) {
       messages = await compact(messages);
+      systemPrompt = await rebuildSystemPromptAfterCompact(systemPrompt); // ⑫
     }
 
     response = await client.messages.create({
@@ -596,8 +682,6 @@ type StartupSection = {
 };
 
 async function buildSystemPromptWithBreakdown(): Promise<string> {
-  const skillsBlock = `<available_skills>\n${skillCatalog}\n</available_skills>\n관련 작업을 할 때는 Skill 도구로 해당 문서를 먼저 읽으세요.`;
-
   // ★ system 텍스트와 tools(도구 스키마)는 API 요청에서 서로 다른 필드다.
   //   둘 다 컨텍스트를 차지하지만, 원인을 구분하려면 회계도 따로 해야 한다.
   //   (이전 버전은 tools를 매 호출마다 고정으로 끼워 넣어서, 그 고정비가
@@ -616,7 +700,7 @@ async function buildSystemPromptWithBreakdown(): Promise<string> {
       label: mcpEagerLoaded ? "MCP 도구 스키마 (즉시 로드됨)" : "ToolSearch 메타 도구 (MCP 이름조차 노출 안 함)",
       toolsAdd: mcpEagerLoaded ? mcpTools : activeTools.filter((t) => t.name === "ToolSearch"),
     },
-    { label: "Skill 설명", system: skillsBlock },
+    { label: "Skill 설명", system: skillCatalogBlock },
     { label: "전역 CLAUDE.md", system: loadFileBlock(path.join(os.homedir(), ".claude", "CLAUDE.md"), "global_claude_md") },
     { label: "프로젝트 CLAUDE.md", system: loadFileBlock(path.join(WORKDIR, "CLAUDE.md"), "project_claude_md") },
     { label: "Git 상태 (맨 끝 블록)", system: buildGitStatusBlock() },
