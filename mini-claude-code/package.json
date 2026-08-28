@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=22.9.0"
+  },
   "scripts": {
     "mini": "tsx --env-file-if-exists=.env index.ts"
   },
