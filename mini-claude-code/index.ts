@@ -236,7 +236,7 @@ if (mcpTools.length > 0) {
     }
   } else {
     activeTools.push(toolSearchTool);
-    console.log(`   [tool-search] 기본값(지연) — MCP 스키마 ${mcpTools.length}개는 이름만 노출, ToolSearch로 필요할 때만 로드`);
+    console.log(`   [tool-search] 기본값(지연) — MCP 도구 ${mcpTools.length}개는 이름조차 노출 안 됨, ToolSearch로 필요할 때만 로드`);
   }
 }
 
@@ -540,8 +540,9 @@ async function runLoop(
 //    anything" 타임라인을 순서 그대로 조립하고, 각 블록이 실제로 몇
 //    토큰인지 Anthropic의 countTokens API로 직접 측정해본다.
 //
-//      시스템 프롬프트 → Auto memory(MEMORY.md) → 환경 정보
-//      → MCP 도구 이름(지연) → Skill 설명 → 전역 CLAUDE.md → 프로젝트 CLAUDE.md
+//      시스템 프롬프트 → 도구 정의(built-in) → Auto memory(MEMORY.md) → 환경 정보
+//      → MCP 도구(⑪ 모드에 따라 스키마 전체 또는 ToolSearch 메타 도구만)
+//      → Skill 설명 → 전역 CLAUDE.md → 프로젝트 CLAUDE.md
 //      (+ 문서에 따르면 git 브랜치/status/최근 커밋은 시스템 프롬프트 "맨 끝"에
 //        별도 블록으로 더 붙는다 — 그래서 여기서도 마지막에 하나 더 추가)
 // ════════════════════════════════════════════════════════════════════
@@ -569,14 +570,6 @@ function buildEnvironmentInfo(): string {
     `git 저장소 여부: ${isGitRepo}`,
     "</environment_info>",
   ].join("\n");
-}
-
-function buildMcpToolNamesBlock(): string | null {
-  if (mcpTools.length === 0) return null;
-  // 이름 목록은 모드와 무관하게 항상 시스템 프롬프트에 노출된다 — Claude가
-  // "이런 도구가 존재한다"는 것 자체는 알아야 ToolSearch로 찾을 수 있으니까.
-  // 실제 스키마가 언제 tools 배열에 실리는지는 ⑪ TOOL_SEARCH_MODE가 결정한다.
-  return ["<mcp_tools_available>", ...mcpTools.map((t) => `- ${t.name}`), "</mcp_tools_available>"].join("\n");
 }
 
 function buildGitStatusBlock(): string | null {
@@ -614,12 +607,13 @@ async function buildSystemPromptWithBreakdown(): Promise<string> {
     { label: "도구 정의 (built-in 7개 스키마)", toolsAdd: builtinTools },
     { label: "Auto memory (MEMORY.md)", system: loadAutoMemory() },
     { label: "환경 정보", system: buildEnvironmentInfo() },
-    { label: "MCP 도구 이름 (지연, 텍스트만)", system: buildMcpToolNamesBlock() },
     {
       // ⑪ 지금 activeTools의 실제 구성을 그대로 반영한다:
       //   즉시 로드 모드 → MCP 스키마 전부가 여기서 잡힘 (비쌈)
       //   지연 모드      → ToolSearch 메타 도구 하나만 잡힘 (훨씬 쌈) — 이게 "지연"의 효과다
-      label: mcpEagerLoaded ? "MCP 도구 스키마 (즉시 로드됨)" : "ToolSearch 메타 도구 (MCP 스키마는 아직 0개)",
+      //   ★ 실제 Claude Code처럼, 지연 모드에선 MCP 도구 "이름"조차 시스템 프롬프트에
+      //     노출하지 않는다 — 모델은 ToolSearch가 존재한다는 것만 알고 완전히 blind하게 검색한다.
+      label: mcpEagerLoaded ? "MCP 도구 스키마 (즉시 로드됨)" : "ToolSearch 메타 도구 (MCP 이름조차 노출 안 함)",
       toolsAdd: mcpEagerLoaded ? mcpTools : activeTools.filter((t) => t.name === "ToolSearch"),
     },
     { label: "Skill 설명", system: skillsBlock },
