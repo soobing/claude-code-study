@@ -13,9 +13,12 @@
 //   ⑧ 세션 저장      JSONL 기록
 //   ⑨ 인터럽트       Esc
 //   ⑩ 컨텍스트 초기 로드  타이핑 전에 이미 쌓이는 것들 + 실측 토큰 브레이크다운
+//   ⑪ tool search    MCP 스키마를 이름만 노출하고 실제 필요할 때 지연 로드
 //
 // 실행:  npm run mini -- "src 구조 보고 README 만들어줘"
-//        USE_MCP=1 npm run mini -- "지금 몇 시야?"
+//        USE_MCP=1 npm run mini -- "지금 몇 시야?"                     (기본값 = 지연 로드)
+//        USE_MCP=1 ENABLE_TOOL_SEARCH=false npm run mini -- "..."     (즉시 전부 로드)
+//        USE_MCP=1 ENABLE_TOOL_SEARCH=auto npm run mini -- "..."      (10% 임계값으로 자동 판단)
 
 import Anthropic from "@anthropic-ai/sdk";
 import fs from "node:fs";
@@ -157,11 +160,11 @@ const builtinTools: Anthropic.Tool[] = [
 ];
 
 // ════════════════════════════════════════════════════════════════════
-// ⑤ MCP — 외부 프로세스가 공급하는 도구를 tools 배열에 합친다
-//    모델 입장에선 내장 도구와 구별되지 않는다.
+// ⑤ MCP — 외부 프로세스가 공급하는 도구. 모델 입장에선 내장 도구와
+//    구별되지 않지만, 스키마를 tools 배열에 언제 올릴지는 아래 ⑪에서 결정한다.
 // ════════════════════════════════════════════════════════════════════
 let mcp: McpClient | null = null;
-let mcpTools: Anthropic.Tool[] = [];
+let mcpTools: Anthropic.Tool[] = []; // MCP가 제공하는 전체 도구 목록 — "지연 저장고"
 
 if (process.env.USE_MCP === "1") {
   mcp = new McpClient({ name: "mini-claude-code", version: "1.0.0" });
@@ -178,15 +181,69 @@ if (process.env.USE_MCP === "1") {
     description: t.description ?? "",
     input_schema: t.inputSchema as Anthropic.Tool.InputSchema,
   }));
-  console.log(`🔌 MCP 연결됨 — 도구 ${mcpTools.length}개: ${mcpTools.map((t) => t.name).join(", ")}`);
+  console.log(`🔌 MCP 연결됨 — 도구 ${mcpTools.length}개 발견: ${mcpTools.map((t) => t.name).join(", ")}`);
 }
 
-const tools = [...builtinTools, ...mcpTools];
+// ════════════════════════════════════════════════════════════════════
+// ⑪ TOOL SEARCH — MCP 스키마를 언제 tools 배열에 실을지 결정한다.
+//
+//    실제 Claude Code 기본값: 이름만 시스템 프롬프트에 노출하고, 전체
+//    스키마는 지연 상태로 두었다가 모델이 tool search로 필요한 것만
+//    그때그때 불러온다. 아래 세 모드를 흉내낸다:
+//
+//      (미설정/기본)      → 지연. ToolSearch 메타 도구만 등록, MCP 스키마는 0개 상태로 시작.
+//      ENABLE_TOOL_SEARCH=auto  → 전체 스키마가 컨텍스트의 10% 안에 들면 즉시 로드, 아니면 지연.
+//      ENABLE_TOOL_SEARCH=false → 무조건 즉시 전부 로드 (지연 없음).
+// ════════════════════════════════════════════════════════════════════
+const CONTEXT_WINDOW = 200_000; // Sonnet 5 illustrative 기준값
+const TOOL_SEARCH_MODE = process.env.ENABLE_TOOL_SEARCH ?? "deferred"; // "deferred" | "auto" | "false"
+
+const toolSearchTool: Anthropic.Tool = {
+  name: "ToolSearch",
+  description:
+    "이름/키워드로 지연 로드된 MCP 도구를 검색해서 스키마를 지금 불러온다. " +
+    "MCP 도구를 실제로 호출하려면 먼저 이 도구로 찾아서 로드해야 한다.",
+  input_schema: {
+    type: "object",
+    properties: { query: { type: "string", description: "찾고 싶은 도구에 대한 키워드" } },
+    required: ["query"],
+  },
+};
+
+// activeTools = 지금 이 순간 모델에게 실제로 보이는 도구 목록.
+// mutable: ToolSearch가 호출되면 여기 push되어 "다음 턴부터" 직접 호출 가능해진다.
+let activeTools: Anthropic.Tool[] = [...builtinTools];
+let mcpEagerLoaded = false;
+
+if (mcpTools.length > 0) {
+  if (TOOL_SEARCH_MODE === "false") {
+    activeTools.push(...mcpTools);
+    mcpEagerLoaded = true;
+    console.log(`   [tool-search] ENABLE_TOOL_SEARCH=false — MCP 스키마 ${mcpTools.length}개 즉시 전부 로드`);
+  } else if (TOOL_SEARCH_MODE === "auto") {
+    const probe = await client.messages.countTokens({
+      model: MODEL,
+      tools: mcpTools,
+      messages: [{ role: "user", content: "." }],
+    });
+    if (probe.input_tokens < CONTEXT_WINDOW * 0.1) {
+      activeTools.push(...mcpTools);
+      mcpEagerLoaded = true;
+      console.log(`   [tool-search] auto — MCP 스키마 ${probe.input_tokens}토큰 (< 컨텍스트의 10%) → 즉시 로드`);
+    } else {
+      activeTools.push(toolSearchTool);
+      console.log(`   [tool-search] auto — MCP 스키마 ${probe.input_tokens}토큰 (≥ 컨텍스트의 10%) → 지연, ToolSearch 등록`);
+    }
+  } else {
+    activeTools.push(toolSearchTool);
+    console.log(`   [tool-search] 기본값(지연) — MCP 도구 ${mcpTools.length}개는 이름조차 노출 안 됨, ToolSearch로 필요할 때만 로드`);
+  }
+}
 
 // ════════════════════════════════════════════════════════════════════
 // ① 권한 · ② 체크포인트 · ⑧ 세션 저장
 // ════════════════════════════════════════════════════════════════════
-const AUTO_ALLOW = new Set(["Read", "Grep", "Skill", "Agent"]); // 읽기 전용은 안 물음
+const AUTO_ALLOW = new Set(["Read", "Grep", "Skill", "Agent", "ToolSearch"]); // 읽기 전용은 안 물음
 
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 
@@ -283,6 +340,27 @@ async function runTool(name: string, input: any, depth: number): Promise<string>
       return skill.body;
     }
 
+    // ⑪ tool search — 지연된 MCP 스키마를 찾아서 activeTools에 등록한다.
+    //    이 시점 이전엔 이 도구들이 tools 배열에 없어서 모델이 애초에 호출할 수 없었다.
+    //    등록 직후가 아니라 "다음 API 호출부터" 실제로 쓸 수 있게 된다.
+    case "ToolSearch": {
+      const query = String(input.query ?? "").toLowerCase();
+      const matches = mcpTools.filter(
+        (t) => t.name.toLowerCase().includes(query) || (t.description ?? "").toLowerCase().includes(query),
+      );
+      if (matches.length === 0) {
+        return `"${input.query}"에 매칭되는 도구가 없습니다. 검색 가능한 이름: ${mcpTools.map((t) => t.name).join(", ") || "(없음)"}`;
+      }
+      const newlyAdded = matches.filter((m) => !activeTools.some((t) => t.name === m.name));
+      activeTools.push(...newlyAdded);
+      console.log(`   [tool-search] "${input.query}" → ${matches.map((t) => t.name).join(", ")} 스키마 로드됨`);
+      return [
+        `다음 도구를 로드했습니다: ${matches.map((t) => t.name).join(", ")}`,
+        ...matches.map((t) => `- ${t.name}: ${t.description}`),
+        "이제 이 도구를 직접 호출할 수 있습니다.",
+      ].join("\n");
+    }
+
     // ⑥ subagent — 새 messages 배열로 루프를 한 벌 더 돌리고 요약만 반환
     case "Agent": {
       if (depth >= 1) throw new Error("subagent는 중첩할 수 없습니다.");
@@ -364,7 +442,7 @@ async function runLoop(
     model: MODEL,
     max_tokens: 4096,
     system: systemPrompt,
-    tools,
+    tools: activeTools,
     messages,
   });
 
@@ -448,7 +526,7 @@ async function runLoop(
       model: MODEL,
       max_tokens: 4096,
       system: systemPrompt,
-      tools,
+      tools: activeTools,
       messages,
     });
   }
@@ -462,8 +540,9 @@ async function runLoop(
 //    anything" 타임라인을 순서 그대로 조립하고, 각 블록이 실제로 몇
 //    토큰인지 Anthropic의 countTokens API로 직접 측정해본다.
 //
-//      시스템 프롬프트 → Auto memory(MEMORY.md) → 환경 정보
-//      → MCP 도구 이름(지연) → Skill 설명 → 전역 CLAUDE.md → 프로젝트 CLAUDE.md
+//      시스템 프롬프트 → 도구 정의(built-in) → Auto memory(MEMORY.md) → 환경 정보
+//      → MCP 도구(⑪ 모드에 따라 스키마 전체 또는 ToolSearch 메타 도구만)
+//      → Skill 설명 → 전역 CLAUDE.md → 프로젝트 CLAUDE.md
 //      (+ 문서에 따르면 git 브랜치/status/최근 커밋은 시스템 프롬프트 "맨 끝"에
 //        별도 블록으로 더 붙는다 — 그래서 여기서도 마지막에 하나 더 추가)
 // ════════════════════════════════════════════════════════════════════
@@ -491,15 +570,6 @@ function buildEnvironmentInfo(): string {
     `git 저장소 여부: ${isGitRepo}`,
     "</environment_info>",
   ].join("\n");
-}
-
-function buildMcpToolNamesBlock(): string | null {
-  if (mcpTools.length === 0) return null;
-  // ★ 실제 Claude Code는 이름만 먼저 노출하고 전체 스키마는 필요할 때 tool
-  //   search로 지연 로드한다. 이 미니 구현은 단순화를 위해 tools 배열엔
-  //   이미 전체 스키마를 올려두지만(⑤ 참고), 여기 system 텍스트 회계는
-  //   "이름만 봤을 때"의 비용만 따로 잰다.
-  return ["<mcp_tools_available>", ...mcpTools.map((t) => `- ${t.name}`), "</mcp_tools_available>"].join("\n");
 }
 
 function buildGitStatusBlock(): string | null {
@@ -537,8 +607,15 @@ async function buildSystemPromptWithBreakdown(): Promise<string> {
     { label: "도구 정의 (built-in 7개 스키마)", toolsAdd: builtinTools },
     { label: "Auto memory (MEMORY.md)", system: loadAutoMemory() },
     { label: "환경 정보", system: buildEnvironmentInfo() },
-    { label: "MCP 도구 이름 (지연, 텍스트만)", system: buildMcpToolNamesBlock() },
-    { label: "MCP 도구 스키마 (미니 구현 한계: 이미 로드됨)", toolsAdd: mcpTools },
+    {
+      // ⑪ 지금 activeTools의 실제 구성을 그대로 반영한다:
+      //   즉시 로드 모드 → MCP 스키마 전부가 여기서 잡힘 (비쌈)
+      //   지연 모드      → ToolSearch 메타 도구 하나만 잡힘 (훨씬 쌈) — 이게 "지연"의 효과다
+      //   ★ 실제 Claude Code처럼, 지연 모드에선 MCP 도구 "이름"조차 시스템 프롬프트에
+      //     노출하지 않는다 — 모델은 ToolSearch가 존재한다는 것만 알고 완전히 blind하게 검색한다.
+      label: mcpEagerLoaded ? "MCP 도구 스키마 (즉시 로드됨)" : "ToolSearch 메타 도구 (MCP 이름조차 노출 안 함)",
+      toolsAdd: mcpEagerLoaded ? mcpTools : activeTools.filter((t) => t.name === "ToolSearch"),
+    },
     { label: "Skill 설명", system: skillsBlock },
     { label: "전역 CLAUDE.md", system: loadFileBlock(path.join(os.homedir(), ".claude", "CLAUDE.md"), "global_claude_md") },
     { label: "프로젝트 CLAUDE.md", system: loadFileBlock(path.join(WORKDIR, "CLAUDE.md"), "project_claude_md") },
