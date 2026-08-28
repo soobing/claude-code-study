@@ -15,11 +15,13 @@
 //   ⑩ 컨텍스트 초기 로드  타이핑 전에 이미 쌓이는 것들 + 실측 토큰 브레이크다운
 //   ⑪ tool search    MCP 스키마를 이름만 노출하고 실제 필요할 때 지연 로드
 //   ⑫ 압축 후 skill 재주입  설명 목록은 사라지고, 호출했던 스킬 본문만 캡 걸고 재주입
+//   ⑬ disable-model-invocation  부작용 있는 스킬은 모델이 못 부름, /이름으로 사용자만 직접 호출
 //
 // 실행:  npm run mini -- "src 구조 보고 README 만들어줘"
 //        USE_MCP=1 npm run mini -- "지금 몇 시야?"                     (기본값 = 지연 로드)
 //        USE_MCP=1 ENABLE_TOOL_SEARCH=false npm run mini -- "..."     (즉시 전부 로드)
 //        USE_MCP=1 ENABLE_TOOL_SEARCH=auto npm run mini -- "..."      (10% 임계값으로 자동 판단)
+//        npm run mini -- "/commit-push 지금까지 변경사항 커밋해줘"        (사용자 직접 호출)
 
 import Anthropic from "@anthropic-ai/sdk";
 import fs from "node:fs";
@@ -63,8 +65,14 @@ const postToolUseHooks: PostHook[] = [
 // ════════════════════════════════════════════════════════════════════
 // ④ SKILLS — 설명만 시스템 프롬프트에 상시, 본문은 Skill 도구로 로드
 //    /context 에서 "17 skills · 2.1k tokens" 로 보이던 게 이 구조다.
+//
+// ⑬ disable-model-invocation — 커밋/배포/메시지 전송처럼 부작용이 있는
+//    스킬은 모델이 스스로 판단해서 부르면 안 된다. 그런 스킬은
+//    disableModelInvocation: true를 달아서 skillCatalog(설명 목록)와
+//    모델의 Skill 도구 호출 모두에서 제외하고, 사용자가 /이름으로
+//    직접 호출했을 때만 로드되게 한다.
 // ════════════════════════════════════════════════════════════════════
-const SKILLS: Record<string, { description: string; body: string }> = {
+const SKILLS: Record<string, { description: string; body: string; disableModelInvocation?: boolean }> = {
   "readme-style": {
     description: "README를 작성하거나 수정할 때의 이 팀 표준 형식",
     body: [
@@ -75,10 +83,23 @@ const SKILLS: Record<string, { description: string; body: string }> = {
       "4. 파일 목록은 표가 아니라 트리 형태로 적는다.",
     ].join("\n"),
   },
+  "commit-push": {
+    description: "변경사항을 커밋하고 push한다 (부작용 있음 — 모델이 스스로 호출 불가)",
+    disableModelInvocation: true,
+    body: [
+      "# 커밋 & 푸시 규칙",
+      "1. git status로 변경사항을 확인한다.",
+      "2. 의미 있는 단위로 파일을 나눠서 git add 한다.",
+      "3. 커밋 메시지는 '무엇을'이 아니라 '왜'를 설명한다.",
+      "4. git push origin <현재 브랜치>로 push한다.",
+    ].join("\n"),
+  },
 };
 
-// 세션 시작 시 "이름 + 설명"만 주입한다 (본문은 아직 컨텍스트에 없음)
+// 세션 시작 시 "이름 + 설명"만 주입한다 (본문은 아직 컨텍스트에 없음).
+// ⑬ disableModelInvocation 스킬은 여기서 걸러져서 모델이 존재 자체를 모른다.
 const skillCatalog = Object.entries(SKILLS)
+  .filter(([, s]) => !s.disableModelInvocation)
   .map(([name, s]) => `- ${name}: ${s.description}`)
   .join("\n");
 
@@ -341,6 +362,14 @@ async function runTool(name: string, input: any, depth: number): Promise<string>
     case "Skill": {
       const skill = SKILLS[input.name];
       if (!skill) throw new Error(`그런 skill이 없습니다: ${input.name}`);
+      // ⑬ 모델이 스스로 부르면 안 되는 스킬 —애초에 skillCatalog에 이름도
+      //   없었으니 정상적으로는 여기 도달할 일이 없지만, 방어적으로 한 번 더 막는다.
+      if (skill.disableModelInvocation) {
+        throw new Error(
+          `"${input.name}"은 disable-model-invocation 스킬이라 모델이 직접 호출할 수 없습니다. ` +
+            `사용자가 /${input.name}으로 직접 호출해야 합니다.`,
+        );
+      }
       recordSkillInvocation(input.name); // ⑫ 압축 후 재주입 대상으로 기록
       console.log(`   [skill] ${input.name} 본문 로드 (${skill.body.length}자)`);
       return skill.body;
@@ -750,11 +779,29 @@ process.on("SIGINT", () => {
   console.log("\n⏹  중단 요청됨 — 현재 턴까지만 처리합니다");
 });
 
-log({ type: "user", content: userPrompt });
+// ⑬ 슬래시로 직접 호출 — "/이름 ..." 형태면 모델의 판단을 거치지 않고
+//   그 스킬을 즉시 로드한다. disableModelInvocation 스킬을 쓸 수 있는
+//   유일한 경로. (실제 Claude Code의 REPL에서 /commit-push 같은 걸 치는
+//   것과 같은 개념 — 우리는 REPL이 없으니 CLI 인자 맨 앞으로 흉내낸다.)
+let initialUserContent = userPrompt;
+const slashMatch = userPrompt.match(/^\/(\S+)\s*([\s\S]*)$/);
+if (slashMatch) {
+  const [, skillName, rest] = slashMatch;
+  const skill = SKILLS[skillName];
+  if (!skill) {
+    console.error(`❌ 그런 skill이 없습니다: /${skillName}`);
+    process.exit(1);
+  }
+  recordSkillInvocation(skillName); // ⑫ 압축 재주입 대상으로도 기록됨
+  console.log(`   [skill] /${skillName} 사용자가 직접 호출 — 본문 로드 (${skill.body.length}자)`);
+  initialUserContent = `<skill name="${skillName}">\n${skill.body}\n</skill>\n\n${rest || `${skillName} 스킬 지침을 따라 작업해줘.`}`;
+}
+
+log({ type: "user", content: initialUserContent });
 
 const systemPrompt = await buildSystemPromptWithBreakdown();
 
-const final = await runLoop([{ role: "user", content: userPrompt }], systemPrompt, 0);
+const final = await runLoop([{ role: "user", content: initialUserContent }], systemPrompt, 0);
 
 for (const block of final.content) {
   if (block.type === "text") console.log(`\n✅ ${block.text}`);
