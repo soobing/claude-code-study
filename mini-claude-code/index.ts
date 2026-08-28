@@ -12,12 +12,14 @@
 //   ⑦ 압축           컨텍스트가 차면 옛 대화를 요약으로 교체
 //   ⑧ 세션 저장      JSONL 기록
 //   ⑨ 인터럽트       Esc
+//   ⑩ 컨텍스트 초기 로드  타이핑 전에 이미 쌓이는 것들 + 실측 토큰 브레이크다운
 //
 // 실행:  npm run mini -- "src 구조 보고 README 만들어줘"
 //        USE_MCP=1 npm run mini -- "지금 몇 시야?"
 
 import Anthropic from "@anthropic-ai/sdk";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { execSync } from "node:child_process";
 import readline from "node:readline/promises";
@@ -455,6 +457,128 @@ async function runLoop(
 }
 
 // ════════════════════════════════════════════════════════════════════
+// ⑩ 컨텍스트 윈도우 초기 로드 — 사용자가 한 글자도 치기 전에 시스템
+//    프롬프트에 쌓이는 계층들. context-window 문서의 "Before you type
+//    anything" 타임라인을 순서 그대로 조립하고, 각 블록이 실제로 몇
+//    토큰인지 Anthropic의 countTokens API로 직접 측정해본다.
+//
+//      시스템 프롬프트 → Auto memory(MEMORY.md) → 환경 정보
+//      → MCP 도구 이름(지연) → Skill 설명 → 전역 CLAUDE.md → 프로젝트 CLAUDE.md
+//      (+ 문서에 따르면 git 브랜치/status/최근 커밋은 시스템 프롬프트 "맨 끝"에
+//        별도 블록으로 더 붙는다 — 그래서 여기서도 마지막에 하나 더 추가)
+// ════════════════════════════════════════════════════════════════════
+function loadFileBlock(filePath: string, tag: string): string | null {
+  if (!fs.existsSync(filePath)) return null;
+  return `<${tag}>\n${fs.readFileSync(filePath, "utf8")}\n</${tag}>`;
+}
+
+function loadAutoMemory(): string | null {
+  const memPath = path.join(WORKDIR, "MEMORY.md");
+  if (!fs.existsSync(memPath)) return null;
+  // 문서 규칙: 최초 200줄 또는 25KB 중 먼저 도달하는 지점까지만 로드한다
+  const capped = fs.readFileSync(memPath, "utf8").slice(0, 25_000).split("\n").slice(0, 200).join("\n");
+  return `<auto_memory>\n${capped}\n</auto_memory>`;
+}
+
+function buildEnvironmentInfo(): string {
+  const isGitRepo = fs.existsSync(path.join(WORKDIR, ".git"));
+  return [
+    "<environment_info>",
+    `작업 디렉토리: ${WORKDIR}`,
+    `플랫폼: ${process.platform}`,
+    `셸: ${process.env.SHELL ?? "unknown"}`,
+    `OS 버전: ${os.release()}`,
+    `git 저장소 여부: ${isGitRepo}`,
+    "</environment_info>",
+  ].join("\n");
+}
+
+function buildMcpToolNamesBlock(): string | null {
+  if (mcpTools.length === 0) return null;
+  // ★ 실제 Claude Code는 이름만 먼저 노출하고 전체 스키마는 필요할 때 tool
+  //   search로 지연 로드한다. 이 미니 구현은 단순화를 위해 tools 배열엔
+  //   이미 전체 스키마를 올려두지만(⑤ 참고), 여기 system 텍스트 회계는
+  //   "이름만 봤을 때"의 비용만 따로 잰다.
+  return ["<mcp_tools_available>", ...mcpTools.map((t) => `- ${t.name}`), "</mcp_tools_available>"].join("\n");
+}
+
+function buildGitStatusBlock(): string | null {
+  try {
+    const branch = execSync("git branch --show-current", { cwd: WORKDIR, encoding: "utf8" }).trim();
+    const status = execSync("git status --porcelain", { cwd: WORKDIR, encoding: "utf8" }).trim();
+    const log = execSync("git log --oneline -5", { cwd: WORKDIR, encoding: "utf8" }).trim();
+    return [
+      "<git_status>",
+      `브랜치: ${branch || "(없음)"}`,
+      `변경사항: ${status ? "\n" + status : "(clean)"}`,
+      `최근 커밋:\n${log || "(없음)"}`,
+      "</git_status>",
+    ].join("\n");
+  } catch {
+    return null; // git 저장소가 아니면 조용히 생략
+  }
+}
+
+type StartupSection = {
+  label: string;
+  system?: string | null; // system 프롬프트에 텍스트로 누적되는 부분
+  toolsAdd?: Anthropic.Tool[]; // tools 배열에 스키마로 누적되는 부분
+};
+
+async function buildSystemPromptWithBreakdown(): Promise<string> {
+  const skillsBlock = `<available_skills>\n${skillCatalog}\n</available_skills>\n관련 작업을 할 때는 Skill 도구로 해당 문서를 먼저 읽으세요.`;
+
+  // ★ system 텍스트와 tools(도구 스키마)는 API 요청에서 서로 다른 필드다.
+  //   둘 다 컨텍스트를 차지하지만, 원인을 구분하려면 회계도 따로 해야 한다.
+  //   (이전 버전은 tools를 매 호출마다 고정으로 끼워 넣어서, 그 고정비가
+  //    전부 맨 처음 측정되는 섹션 — "시스템 프롬프트" — 로 잘못 잡혔었다.)
+  const sections: StartupSection[] = [
+    { label: "시스템 프롬프트 (지시문)", system: SYSTEM_BASE },
+    { label: "도구 정의 (built-in 7개 스키마)", toolsAdd: builtinTools },
+    { label: "Auto memory (MEMORY.md)", system: loadAutoMemory() },
+    { label: "환경 정보", system: buildEnvironmentInfo() },
+    { label: "MCP 도구 이름 (지연, 텍스트만)", system: buildMcpToolNamesBlock() },
+    { label: "MCP 도구 스키마 (미니 구현 한계: 이미 로드됨)", toolsAdd: mcpTools },
+    { label: "Skill 설명", system: skillsBlock },
+    { label: "전역 CLAUDE.md", system: loadFileBlock(path.join(os.homedir(), ".claude", "CLAUDE.md"), "global_claude_md") },
+    { label: "프로젝트 CLAUDE.md", system: loadFileBlock(path.join(WORKDIR, "CLAUDE.md"), "project_claude_md") },
+    { label: "Git 상태 (맨 끝 블록)", system: buildGitStatusBlock() },
+  ];
+
+  console.log("\n📦 세션 시작 전 로드되는 컨텍스트 (countTokens API로 실측)");
+  console.log("─".repeat(62));
+
+  let cumulativeSystem = "";
+  let cumulativeTools: Anthropic.Tool[] = [];
+  let prevTokens = 0;
+  for (const s of sections) {
+    const hasSystem = !!s.system;
+    const hasTools = !!s.toolsAdd && s.toolsAdd.length > 0;
+    if (!hasSystem && !hasTools) {
+      console.log(`  ${s.label.padEnd(30)}  (없음 — 스킵)`);
+      continue;
+    }
+    if (hasSystem) cumulativeSystem += (cumulativeSystem ? "\n\n" : "") + s.system;
+    if (hasTools) cumulativeTools = [...cumulativeTools, ...s.toolsAdd!];
+
+    const counted = await client.messages.countTokens({
+      model: MODEL,
+      system: cumulativeSystem || undefined,
+      tools: cumulativeTools.length ? cumulativeTools : undefined,
+      messages: [{ role: "user", content: "." }],
+    });
+    const marginal = counted.input_tokens - prevTokens;
+    prevTokens = counted.input_tokens;
+    console.log(`  ${s.label.padEnd(30)} +${String(marginal).padStart(5)} tokens`);
+  }
+
+  console.log("─".repeat(62));
+  console.log(`  ${"합계 (첫 프롬프트 이전)".padEnd(30)} ${String(prevTokens).padStart(6)} tokens\n`);
+
+  return cumulativeSystem;
+}
+
+// ════════════════════════════════════════════════════════════════════
 // 진입점
 // ════════════════════════════════════════════════════════════════════
 const userPrompt = process.argv.slice(2).join(" ") || "이 폴더에 어떤 파일이 있는지 알려줘";
@@ -467,13 +591,7 @@ process.on("SIGINT", () => {
 
 log({ type: "user", content: userPrompt });
 
-// ④ skills는 "설명만" 시스템 프롬프트로. 본문은 Skill 도구를 부를 때 들어온다.
-const systemPrompt = `${SYSTEM_BASE}
-
-<available_skills>
-${skillCatalog}
-</available_skills>
-관련 작업을 할 때는 Skill 도구로 해당 문서를 먼저 읽으세요.`;
+const systemPrompt = await buildSystemPromptWithBreakdown();
 
 const final = await runLoop([{ role: "user", content: userPrompt }], systemPrompt, 0);
 
