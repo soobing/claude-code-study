@@ -16,12 +16,14 @@
 //   ⑪ tool search    MCP 스키마를 이름만 노출하고 실제 필요할 때 지연 로드
 //   ⑫ 압축 후 skill 재주입  설명 목록은 사라지고, 호출했던 스킬 본문만 캡 걸고 재주입
 //   ⑬ disable-model-invocation  부작용 있는 스킬은 모델이 못 부름, /이름으로 사용자만 직접 호출
+//   ⑭ 경로 범위 규칙 + 중첩 CLAUDE.md  매칭 파일을 읽을 때만 로드, 압축 후 다시 읽을 때까지 손실
 //
 // 실행:  npm run mini -- "src 구조 보고 README 만들어줘"
 //        USE_MCP=1 npm run mini -- "지금 몇 시야?"                     (기본값 = 지연 로드)
 //        USE_MCP=1 ENABLE_TOOL_SEARCH=false npm run mini -- "..."     (즉시 전부 로드)
 //        USE_MCP=1 ENABLE_TOOL_SEARCH=auto npm run mini -- "..."      (10% 임계값으로 자동 판단)
 //        npm run mini -- "/commit-push 지금까지 변경사항 커밋해줘"        (사용자 직접 호출)
+//        npm run mini -- "src/api/hello.test.ts 읽고 뭐가 있는지 알려줘"  (경로 규칙 + 중첩 CLAUDE.md 로드)
 
 import Anthropic from "@anthropic-ai/sdk";
 import fs from "node:fs";
@@ -312,7 +314,65 @@ function safePath(p: string): string {
   return resolved;
 }
 
-async function runTool(name: string, input: any, depth: number): Promise<string> {
+// ════════════════════════════════════════════════════════════════════
+// ⑭ 경로 범위 규칙(paths:) + 중첩 CLAUDE.md — Read가 매칭되는 파일을 열
+//    때만 "메시지 기록"에 규칙/CLAUDE.md 내용을 끼워 넣는다. systemPrompt가
+//    아니라 messages에 들어가므로, ⑦ compact()가 다른 모든 대화와 함께
+//    이걸 요약해버린다 — 그래서 압축 후엔 매칭되는 파일을 "다시 읽어야만"
+//    재등장한다. injected(rules/nestedClaudeMdDirs)가 그 "다시 읽을 때까지
+//    손실" 상태를 흉내낸다: runLoop가 compact 성공 직후 이걸 비운다.
+//
+//    ★ injected는 runLoop 호출마다 새로 만드는 로컬 상태다 — subagent는
+//      메인 대화와 완전히 별도 컨텍스트라서, 이미 메인에서 로드된 규칙도
+//      subagent 입장에선 처음 보는 것처럼 다시 로드돼야 하기 때문.
+// ════════════════════════════════════════════════════════════════════
+type InjectionState = {
+  rules: Set<string>; // 이번 epoch에 이미 로드한 규칙 이름
+  nestedClaudeMdDirs: Set<string>; // 이번 epoch에 이미 로드한 CLAUDE.md 디렉토리
+};
+
+type PathRule = { name: string; pattern: RegExp; content: string };
+
+const PATH_RULES: PathRule[] = [
+  {
+    name: "api-conventions.md",
+    pattern: /^src\/api\//,
+    content: [
+      "# API 컨벤션",
+      "- 모든 핸들러는 async function으로 작성한다.",
+      "- 에러는 던지지 말고 { error: string } 형태로 반환한다.",
+    ].join("\n"),
+  },
+  {
+    name: "testing.md",
+    pattern: /\.test\.ts$/,
+    content: ["# 테스트 작성 규칙", "- describe/it 대신 test()만 쓴다.", "- 테스트 파일은 대상 파일과 같은 디렉토리에 둔다."].join(
+      "\n",
+    ),
+  },
+];
+
+function relPath(absPath: string): string {
+  return path.relative(WORKDIR, absPath).split(path.sep).join("/");
+}
+
+// 파일이 있는 디렉토리부터 WORKDIR 바로 아래까지 올라가며 가장 가까운
+// CLAUDE.md를 찾는다. WORKDIR 자체의 CLAUDE.md는 ⑩에서 이미 따로 다룬다.
+function findNestedClaudeMd(filePath: string, injectedDirs: Set<string>): { dir: string; content: string } | null {
+  let dir = path.dirname(filePath);
+  while (dir.startsWith(WORKDIR + path.sep)) {
+    const candidate = path.join(dir, "CLAUDE.md");
+    if (fs.existsSync(candidate)) {
+      if (injectedDirs.has(dir)) return null; // 이번 epoch엔 이미 로드됨
+      injectedDirs.add(dir);
+      return { dir, content: fs.readFileSync(candidate, "utf8") };
+    }
+    dir = path.dirname(dir);
+  }
+  return null;
+}
+
+async function runTool(name: string, input: any, depth: number, injected: InjectionState): Promise<string> {
   // MCP 도구는 외부 프로세스로 위임
   if (name.startsWith("mcp__demo__")) {
     const res = await mcp!.callTool({
@@ -326,8 +386,28 @@ async function runTool(name: string, input: any, depth: number): Promise<string>
   }
 
   switch (name) {
-    case "Read":
-      return fs.readFileSync(safePath(input.file_path), "utf8");
+    // ⑭ 파일 내용 + (매칭되면) 경로 규칙 + 중첩 CLAUDE.md를 함께 반환한다.
+    case "Read": {
+      const target = safePath(input.file_path);
+      let content = fs.readFileSync(target, "utf8");
+
+      const rel = relPath(target);
+      for (const rule of PATH_RULES) {
+        if (rule.pattern.test(rel) && !injected.rules.has(rule.name)) {
+          injected.rules.add(rule.name);
+          console.log(`   [rule] .claude/rules/${rule.name} 로드됨 (경로 매칭: ${rel})`);
+          content += `\n\n<rule name="${rule.name}">\n${rule.content}\n</rule>`;
+        }
+      }
+
+      const nested = findNestedClaudeMd(target, injected.nestedClaudeMdDirs);
+      if (nested) {
+        console.log(`   [claude.md] ${relPath(nested.dir)}/CLAUDE.md 로드됨`);
+        content += `\n\n<nested_claude_md dir="${relPath(nested.dir)}">\n${nested.content}\n</nested_claude_md>`;
+      }
+
+      return content;
+    }
 
     case "Write": {
       const target = safePath(input.file_path);
@@ -509,14 +589,24 @@ async function buildInvokedSkillsBlock(): Promise<string | null> {
 }
 
 async function rebuildSystemPromptAfterCompact(currentSystemPrompt: string): Promise<string> {
-  // skillCatalogBlock(설명 목록)을 통째로 제거 — 압축 후엔 이게 다시 안 들어간다.
-  const withoutCatalog = currentSystemPrompt
-    .replace(skillCatalogBlock, "")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-
+  // ★ skillCatalogBlock(설명 목록)을 문자열에서 지우는 대신, 애초에 다시
+  //   포함하지 않는 방식으로 처음부터 재조립한다. CLAUDE.md와 auto memory는
+  //   기존 스냅샷을 재활용하지 않고 loadFileBlock/loadAutoMemory를 다시
+  //   호출해서 "디스크에서 다시 주입"을 문자 그대로 구현한다 — 세션 중간에
+  //   그 파일들이 바뀌었다면 압축 후엔 최신 내용이 반영된다.
   const invokedBlock = await buildInvokedSkillsBlock();
-  const rebuilt = invokedBlock ? `${withoutCatalog}\n\n${invokedBlock}` : withoutCatalog;
+
+  const rebuilt = [
+    SYSTEM_BASE,
+    loadAutoMemory(), // 디스크에서 다시 읽음
+    buildEnvironmentInfo(),
+    invokedBlock, // ⑫ skill 설명 목록 대신 호출된 스킬 본문만
+    loadFileBlock(path.join(os.homedir(), ".claude", "CLAUDE.md"), "global_claude_md"), // 디스크에서 다시 읽음
+    loadFileBlock(path.join(WORKDIR, "CLAUDE.md"), "project_claude_md"), // 디스크에서 다시 읽음
+    buildGitStatusBlock(),
+  ]
+    .filter((part): part is string => !!part)
+    .join("\n\n");
 
   const [before, after] = await Promise.all([
     client.messages.countTokens({
@@ -533,7 +623,7 @@ async function rebuildSystemPromptAfterCompact(currentSystemPrompt: string): Pro
     }),
   ]);
   console.log(
-    `   [compact] 시스템 프롬프트 재구성 — skill 설명 목록 제거, 호출된 스킬 ${invokedSkillOrder.length}개 재주입 ` +
+    `   [compact] 시스템 프롬프트 재구성 — CLAUDE.md/memory 디스크에서 재로드, skill 설명 목록 제거, 호출된 스킬 ${invokedSkillOrder.length}개 재주입 ` +
       `(${before.input_tokens.toLocaleString()} → ${after.input_tokens.toLocaleString()} 토큰)`,
   );
 
@@ -551,6 +641,9 @@ async function runLoop(
   depth: number,
 ): Promise<Anthropic.Message> {
   const indent = "  ".repeat(depth);
+  // ⑭ 이 루프(= 이 컨텍스트) 전용 상태. subagent는 별도 runLoop 호출이라
+  //   자기만의 새 Set을 받는다 — 메인에서 이미 로드한 규칙도 여기선 처음.
+  const injected: InjectionState = { rules: new Set(), nestedClaudeMdDirs: new Set() };
 
   let response = await client.messages.create({
     model: MODEL,
@@ -599,7 +692,7 @@ async function runLoop(
 
       // ── 링 4: 실패해도 죽지 않는다 ────────────────────────────────
       try {
-        const result = await runTool(block.name, block.input, depth);
+        const result = await runTool(block.name, block.input, depth, injected);
         postToolUseHooks.forEach((h) => h(block.name, block.input, result)); // ③ PostToolUse
         toolResults.push({
           type: "tool_result",
@@ -635,6 +728,9 @@ async function runLoop(
     if (depth === 0 && used > COMPACT_THRESHOLD) {
       messages = await compact(messages);
       systemPrompt = await rebuildSystemPromptAfterCompact(systemPrompt); // ⑫
+      // ⑭ "다시 읽을 때까지 손실" 상태로 리셋 — 매칭 파일을 재-Read하면 다시 로드된다.
+      injected.rules.clear();
+      injected.nestedClaudeMdDirs.clear();
     }
 
     response = await client.messages.create({
