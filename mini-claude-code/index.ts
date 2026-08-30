@@ -16,12 +16,17 @@
 //   ⑪ tool search    MCP 스키마를 이름만 노출하고 실제 필요할 때 지연 로드
 //   ⑫ 압축 후 skill 재주입  설명 목록은 사라지고, 호출했던 스킬 본문만 캡 걸고 재주입
 //   ⑬ disable-model-invocation  부작용 있는 스킬은 모델이 못 부름, /이름으로 사용자만 직접 호출
+//   ⑭ 프롬프트 캐싱   system/tools/messages 각 계층 끝에 중단점을 찍어 프리픽스를 캐싱,
+//                     턴마다 cache_read/cache_creation 실측치를 출력
 //
 // 실행:  npm run mini -- "src 구조 보고 README 만들어줘"
 //        USE_MCP=1 npm run mini -- "지금 몇 시야?"                     (기본값 = 지연 로드)
 //        USE_MCP=1 ENABLE_TOOL_SEARCH=false npm run mini -- "..."     (즉시 전부 로드)
 //        USE_MCP=1 ENABLE_TOOL_SEARCH=auto npm run mini -- "..."      (10% 임계값으로 자동 판단)
 //        npm run mini -- "/commit-push 지금까지 변경사항 커밋해줘"        (사용자 직접 호출)
+//        DISABLE_PROMPT_CACHING=1 npm run mini -- "..."               (캐싱 끄고 비교)
+//        ENABLE_PROMPT_CACHING_1H=1 npm run mini -- "..."             (1시간 TTL 요청)
+//        ENABLE_PROMPT_CACHING_1H=1 FORCE_PROMPT_CACHING_5M=1 npm run mini -- "..."  (로컬이 관리 설정을 재정의)
 
 import Anthropic from "@anthropic-ai/sdk";
 import fs from "node:fs";
@@ -400,6 +405,10 @@ async function runTool(name: string, input: any, depth: number): Promise<string>
     case "Agent": {
       if (depth >= 1) throw new Error("subagent는 중첩할 수 없습니다.");
       console.log(`   [subagent] 시작: ${input.task}`);
+      // ⑭ 서브에이전트는 부모와 다른 systemPrompt 문자열로 시작하므로 프리픽스가
+      //   부모 것과 다르다 — 첫 호출부터 캐시 미스인 게 당연하다(문서: "첫 호출 시
+      //   캐시 히트가 없고 자체 턴에 걸쳐 따뜻해진다"). 부모의 activeTools/캐시는
+      //   전혀 안 건드리므로 이 호출이 끝나도 부모 쪽 프리픽스는 그대로 유지된다.
       const sub = await runLoop(
         [{ role: "user", content: input.task }],
         `${SYSTEM_BASE}\n당신은 하위 에이전트입니다. 작업을 마치면 결과를 간결히 요약하세요.`,
@@ -417,6 +426,84 @@ async function runTool(name: string, input: any, depth: number): Promise<string>
 }
 
 // ════════════════════════════════════════════════════════════════════
+// ⑭ 프롬프트 캐싱 — 문서(prompt-caching)의 "계층" 모델을 그대로 코드로 옮긴다.
+//
+//    매 요청은 새 API 호출이고 모델은 아무것도 기억하지 못하므로, 캐시는
+//    "이 요청의 앞부분이 저번 요청과 토씨 하나 안 틀리고 같은가"로만 작동한다.
+//    같은 부분만 캐시에서 읽고, 그 뒤로는 전부 다시 계산 + 다시 캐시에 쓴다.
+//    cache_control 중단점을 어디에 찍느냐가 "어디까지가 프리픽스냐"를 정한다:
+//
+//      tools 마지막 도구    — 도구 정의 계층 (ToolSearch로 도구가 늘어나면 여기서 끊김)
+//      system 마지막 블록   — 시스템 프롬프트 계층 (MEMORY.md/CLAUDE.md 포함, ⑫ 압축 후 재구성되면 여기서 끊김)
+//      messages 마지막 블록 — 대화 계층 (매 턴 새 메시지로 옮겨감 → 직전 턴까지는 항상 캐시 히트)
+//
+//    최대 4개 중단점이라는 API 제한 안에서 3개만 쓴다. 문서의 "노력 수준/모델도
+//    프롬프트 텍스트엔 없지만 캐시 키의 일부"라는 지점은 이 미니 구현엔 없다 —
+//    MODEL이 상수라 애초에 안 바뀌기 때문. 실제로 모델/노력 수준을 바꿀 수 있는
+//    하네스라면 그 값이 바뀔 때마다 캐시가 통째로 무효화된다는 뜻이다.
+//
+//    TTL: 실제 Claude Code는 Claude 구독이면 자동 1시간, API 키/타사 제공자면
+//    기본 5분이다. 여기선 그 구분을 흉내낸 환경변수 두 개만 둔다.
+//    FORCE_PROMPT_CACHING_5M이 ENABLE_PROMPT_CACHING_1H보다 우선하는 순서까지
+//    문서 그대로 재현한다 — "로컬 환경변수가 관리 설정을 이길 수 있다"는 지점.
+// ════════════════════════════════════════════════════════════════════
+const CACHE_DISABLED = process.env.DISABLE_PROMPT_CACHING === "1";
+const CACHE_TTL: "5m" | "1h" =
+  process.env.FORCE_PROMPT_CACHING_5M === "1" ? "5m" : process.env.ENABLE_PROMPT_CACHING_1H === "1" ? "1h" : "5m";
+
+function cacheControl(): Anthropic.CacheControlEphemeral | undefined {
+  return CACHE_DISABLED ? undefined : { type: "ephemeral", ttl: CACHE_TTL };
+}
+
+// 시스템 프롬프트 문자열 → 캐시 중단점이 찍힌 content-block 배열.
+function withSystemCache(system: string): string | Anthropic.TextBlockParam[] {
+  if (CACHE_DISABLED) return system;
+  return [{ type: "text", text: system, cache_control: cacheControl() }];
+}
+
+// tools 배열의 "마지막" 항목에만 중단점을 찍는다. 원본 배열/객체는 절대 변형하지
+// 않고 매번 새 배열을 반환한다 — ToolSearch가 나중에 도구를 append해도 예전
+// 마지막 도구엔 중단점이 안 남아있으므로(그러지 않으면 중단점이 계속 누적돼 4개
+// 제한을 넘긴다) 항상 "현재 시점의 진짜 마지막"에만 정확히 하나 찍히게 된다.
+function withToolsCache(tools: Anthropic.Tool[]): Anthropic.Tool[] {
+  if (CACHE_DISABLED || tools.length === 0) return tools;
+  return tools.map((t, i) => (i === tools.length - 1 ? { ...t, cache_control: cacheControl() } : t));
+}
+
+// messages 배열의 "마지막 메시지, 마지막 블록"에만 중단점을 찍는다.
+// 원본 messages(대화 기록 본체)는 건드리지 않고 요청용 복사본만 만든다 —
+// 그래서 다음 턴엔 이 중단점이 자연스럽게 "직전 메시지"로 밀려나며 사라지고,
+// 그 위치까지는 이미 캐시에 쓰여 있으니 다음 요청이 거기까지 히트한다.
+function withMessagesCache(messages: Anthropic.MessageParam[]): Anthropic.MessageParam[] {
+  if (CACHE_DISABLED || messages.length === 0) return messages;
+  const last = messages[messages.length - 1];
+  const blocks =
+    typeof last.content === "string"
+      ? [{ type: "text" as const, text: last.content }]
+      : last.content.map((b) => ({ ...b }));
+  if (blocks.length === 0) return messages;
+  (blocks[blocks.length - 1] as { cache_control?: Anthropic.CacheControlEphemeral }).cache_control = cacheControl();
+  return [...messages.slice(0, -1), { ...last, content: blocks }];
+}
+
+// 캐시 성능 확인 — 문서가 알려주는 두 필드를 턴마다 그대로 찍는다.
+// "생성이 턴마다 높게 유지되면 프리픽스에서 뭔가 변경되고 있다"는 진단을
+// 눈으로 바로 볼 수 있게 히트율까지 계산한다.
+function logCacheUsage(indent: string, usage: Anthropic.Usage) {
+  const read = usage.cache_read_input_tokens ?? 0;
+  const created = usage.cache_creation_input_tokens ?? 0;
+  const fresh = usage.input_tokens;
+  const total = read + created + fresh;
+  const hitRatio = total > 0 ? Math.round((read / total) * 100) : 0;
+  const ttlNote = usage.cache_creation
+    ? ` [1h:${usage.cache_creation.ephemeral_1h_input_tokens} 5m:${usage.cache_creation.ephemeral_5m_input_tokens}]`
+    : "";
+  console.log(
+    `${indent}   [cache] read ${read.toLocaleString()} · write ${created.toLocaleString()}${ttlNote} · fresh ${fresh.toLocaleString()} · 총 ${total.toLocaleString()} · 히트율 ${hitRatio}%`,
+  );
+}
+
+// ════════════════════════════════════════════════════════════════════
 // ⑦ 압축 — 컨텍스트가 차면 옛 대화를 요약 한 덩어리로 교체
 //
 //    ★ 중요: 아무 데서나 자르면 안 된다.
@@ -426,7 +513,7 @@ async function runTool(name: string, input: any, depth: number): Promise<string>
 // ════════════════════════════════════════════════════════════════════
 const COMPACT_THRESHOLD = 30_000; // 실전 Claude Code는 컨텍스트 한계 근처에서 발동
 
-async function compact(messages: Anthropic.MessageParam[]): Promise<Anthropic.MessageParam[]> {
+async function compact(messages: Anthropic.MessageParam[], systemPrompt: string): Promise<Anthropic.MessageParam[]> {
   const KEEP_PAIRS = 2;
   const cut = messages.length - KEEP_PAIRS * 2;
   if (cut < 3) return messages; // 자를 게 없음
@@ -436,11 +523,16 @@ async function compact(messages: Anthropic.MessageParam[]): Promise<Anthropic.Me
 
   console.log(`\n🗜  압축 실행 — 앞쪽 ${older.length}개 메시지를 요약으로 교체`);
 
-  // 요약도 API 호출이다 (도구 없이)
+  // ⑭ 요약 요청도 대화와 "동일한 시스템 프롬프트 + 도구 + 기록"을 가진 일회성
+  //   요청이다 — 문서 그대로: 프리픽스를 공유하기 때문에 이 호출은 전체 기록을
+  //   다시 처리하는 대신 기존 캐시를 읽는다. 대화 계층(마지막 메시지)에만
+  //   새 중단점을 찍고 system/tools는 이미 캐시된 그대로 재사용을 노린다.
   const summary = await client.messages.create({
     model: MODEL,
     max_tokens: 1024,
-    messages: [
+    system: withSystemCache(systemPrompt),
+    tools: withToolsCache(activeTools),
+    messages: withMessagesCache([
       ...older,
       {
         role: "user",
@@ -448,8 +540,9 @@ async function compact(messages: Anthropic.MessageParam[]): Promise<Anthropic.Me
           "지금까지의 작업을 요약해줘. 사용자의 원래 요청, 확인한 사실, " +
           "수정한 파일, 남은 할 일을 빠뜨리지 말 것. 요약만 출력.",
       },
-    ],
+    ]),
   });
+  logCacheUsage("  ", summary.usage);
   const text = summary.content.find((b) => b.type === "text");
 
   return [
@@ -555,10 +648,11 @@ async function runLoop(
   let response = await client.messages.create({
     model: MODEL,
     max_tokens: 4096,
-    system: systemPrompt,
-    tools: activeTools,
-    messages,
+    system: withSystemCache(systemPrompt),
+    tools: withToolsCache(activeTools),
+    messages: withMessagesCache(messages),
   });
+  logCacheUsage(indent, response.usage); // ⑭ 첫 턴도 빠짐없이 찍는다 (도구 호출 없이 바로 끝나는 턴 포함)
 
   while (response.stop_reason === "tool_use" && !interrupted) {
     // ── 링 3: tool_use 블록을 "전부" 순회 (병렬 호출 대응) ──────────
@@ -630,20 +724,20 @@ async function runLoop(
       response.usage.input_tokens +
       (response.usage.cache_read_input_tokens ?? 0) +
       (response.usage.cache_creation_input_tokens ?? 0);
-    console.log(`${indent}   [컨텍스트 ${used.toLocaleString()} 토큰]`);
 
     if (depth === 0 && used > COMPACT_THRESHOLD) {
-      messages = await compact(messages);
-      systemPrompt = await rebuildSystemPromptAfterCompact(systemPrompt); // ⑫
+      messages = await compact(messages, systemPrompt);
+      systemPrompt = await rebuildSystemPromptAfterCompact(systemPrompt); // ⑫ — 이 시점부터 system이 바뀌므로 다음 턴은 시스템 계층 캐시 미스
     }
 
     response = await client.messages.create({
       model: MODEL,
       max_tokens: 4096,
-      system: systemPrompt,
-      tools: activeTools,
-      messages,
+      system: withSystemCache(systemPrompt),
+      tools: withToolsCache(activeTools),
+      messages: withMessagesCache(messages),
     });
+    logCacheUsage(indent, response.usage); // ⑭ 이 턴이 마지막이어도(도구 호출 없이 종료) 여기서 찍힌다
   }
 
   return response;
