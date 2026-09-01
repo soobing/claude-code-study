@@ -18,6 +18,8 @@
 //   ⑬ disable-model-invocation  부작용 있는 스킬은 모델이 못 부름, /이름으로 사용자만 직접 호출
 //   ⑭ 프롬프트 캐싱   system/tools/messages 각 계층 끝에 중단점을 찍어 프리픽스를 캐싱,
 //                     턴마다 cache_read/cache_creation 실측치를 출력
+//   ⑮ 플러그인        콘텐츠형(스킬/명령) vs MCP 제공형 — 캐시 영향이 다른 이유를
+//                     ④ SKILLS · ⑤ MCP 경로에 그대로 매핑해 대조
 //
 // 실행:  npm run mini -- "src 구조 보고 README 만들어줘"
 //        USE_MCP=1 npm run mini -- "지금 몇 시야?"                     (기본값 = 지연 로드)
@@ -270,6 +272,42 @@ if (mcpTools.length > 0) {
     console.log(`   [tool-search] 기본값(지연) — MCP 도구 ${mcpTools.length}개는 이름조차 노출 안 됨, ToolSearch로 필요할 때만 로드`);
   }
 }
+
+// ════════════════════════════════════════════════════════════════════
+// ⑮ PLUGINS — 콘텐츠형 플러그인 vs MCP 제공 플러그인, 캐시 영향이 다른 이유
+//
+//    문서 규칙: Skills/commands/agents/hooks/LSP 서버/monitors/themes를
+//    제공하는 플러그인은 캐시를 무효화하지 않는다. "이들이 요청에 추가하는
+//    모든 것은 기존 대화 뒤에 추가되기 때문" — 이건 새로운 개념이 아니라
+//    우리 프로젝트의 ④ SKILLS가 이미 그 모양이다: skillCatalog(설명)는
+//    세션 시작 시 시스템 프롬프트에 딱 한 번 실리고, 본문은 Skill 도구가
+//    "호출되는 그 순간" 대화(messages) 맨 뒤에 덧붙는다(runTool의 "Skill"
+//    케이스, 그리고 스킬을 /이름으로 직접 부르는 진입점 코드 참고).
+//    그래서 콘텐츠형 플러그인을 껐다 켜도 이미 캐시된 system/tools/이전
+//    대화 프리픽스는 전혀 안 건드린다 — 다음 요청은 새 내용만 캐시에 쓴다.
+//
+//    예외는 MCP 서버를 제공하는 플러그인이다. 그 서버가 공급하는 도구
+//    스키마는 ⑤ MCP · ⑪ TOOL SEARCH와 완전히 같은 자리(tools 배열 또는
+//    지연된 도구 검색 저장고)에 들어간다. 그래서 규칙도 MCP 서버 연결·
+//    해제와 동일하게 갈린다:
+//      - deferred: true  (도구 검색으로 연기) → 토글해도 tools 배열의
+//        캐시된 마지막 항목이 안 바뀌므로 무효화 없음.
+//      - deferred: false (프리픽스에 즉시 로드, mcpEagerLoaded 경로) →
+//        토글하는 순간 tools 배열의 내용/마지막 항목이 달라지므로 다음
+//        요청은 도구 계층 캐시를 통째로 다시 씀.
+//
+//    아래는 실제 토글 스위치가 아니라, "콘텐츠가 어느 계층에 꽂히는가"만
+//    선언적으로 대조해 보여주는 예시다 — 실제 동작 증명은 위 ④·⑤·⑪이
+//    이미 코드로 하고 있다.
+// ════════════════════════════════════════════════════════════════════
+type ContentPlugin = { kind: "content"; providesSkills: (keyof typeof SKILLS)[] }; // ④ 경로: 대화 계층에 append, 캐시 무효화 없음
+type McpPlugin = { kind: "mcp"; providesTools: string[]; deferred: boolean }; // ⑤/⑪ 경로: 도구 계층, deferred 여부로 갈림
+
+const EXAMPLE_PLUGINS: Record<string, ContentPlugin | McpPlugin> = {
+  "readme-style-plugin": { kind: "content", providesSkills: ["readme-style"] }, // 캐시 무효화 없음
+  "clock-plugin": { kind: "mcp", providesTools: ["mcp__demo__get_time"], deferred: true }, // 연기됨 → 무효화 없음 (지금 이 프로젝트의 기본 USE_MCP 경로와 동일)
+  "eager-search-plugin": { kind: "mcp", providesTools: ["mcp__search__web"], deferred: false }, // 프리픽스에 즉시 로드 → 토글 시 무효화 (ENABLE_TOOL_SEARCH=false 경로와 동일)
+};
 
 // ════════════════════════════════════════════════════════════════════
 // ① 권한 · ② 체크포인트 · ⑧ 세션 저장
