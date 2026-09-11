@@ -20,15 +20,28 @@
 //                     턴마다 cache_read/cache_creation 실측치를 출력
 //   ⑮ 플러그인        콘텐츠형(스킬/명령) vs MCP 제공형 — 캐시 영향이 다른 이유를
 //                     ④ SKILLS · ⑤ MCP 경로에 그대로 매핑해 대조
+//   ⑯ CLAUDE.md 계층   관리 정책 → 사용자 → 프로젝트(디렉토리 트리 순회, 상위가 먼저)
+//                     → 로컬(CLAUDE.local.md), @import 확장, HTML 주석 제거, claudeMdExcludes
+//   ⑰ .claude/rules/  paths frontmatter 없으면 무조건 로드, 있으면 Read가 그 파일을
+//                     건드리는 순간에만 지연 주입(하위 디렉토리 CLAUDE.md도 동일한 경로)
+//   ⑱ 자동 메모리 경로 git 저장소 기준 projects/<slug>/memory/, autoMemoryDirectory로 재정의,
+//                     autoMemoryEnabled(CLAUDE_CODE_DISABLE_AUTO_MEMORY)로 끄기
+//   ⑲ /memory 명령    API 호출 없이 로드된 CLAUDE.md/규칙/메모리 파일 목록만 출력하고 종료
+//   ⑳ 압축 후 재로드   /compact 후 CLAUDE.md·규칙·자동 메모리를 디스크에서 통째로 다시 읽어
+//                     시스템 프롬프트를 재구성 — 하위 디렉토리/경로별 규칙은 지연 상태로 리셋
 //
 // 실행:  npm run mini -- "src 구조 보고 README 만들어줘"
 //        USE_MCP=1 npm run mini -- "지금 몇 시야?"                     (기본값 = 지연 로드)
 //        USE_MCP=1 ENABLE_TOOL_SEARCH=false npm run mini -- "..."     (즉시 전부 로드)
 //        USE_MCP=1 ENABLE_TOOL_SEARCH=auto npm run mini -- "..."      (10% 임계값으로 자동 판단)
 //        npm run mini -- "/commit-push 지금까지 변경사항 커밋해줘"        (사용자 직접 호출)
+//        npm run mini -- "/memory"                                    (로드된 CLAUDE.md/규칙/메모리 나열, API 호출 없음)
 //        DISABLE_PROMPT_CACHING=1 npm run mini -- "..."               (캐싱 끄고 비교)
 //        ENABLE_PROMPT_CACHING_1H=1 npm run mini -- "..."             (1시간 TTL 요청)
 //        ENABLE_PROMPT_CACHING_1H=1 FORCE_PROMPT_CACHING_5M=1 npm run mini -- "..."  (로컬이 관리 설정을 재정의)
+//        AUTO_MEMORY_DIRECTORY=~/custom-memory npm run mini -- "..."  (자동 메모리 저장 위치 재정의)
+//        CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 npm run mini -- "..."      (자동 메모리 끄기)
+//        CLAUDE_MD_EXCLUDES="**/legacy/CLAUDE.md" npm run mini -- "..."  (특정 CLAUDE.md 제외)
 
 import Anthropic from "@anthropic-ai/sdk";
 import fs from "node:fs";
@@ -349,8 +362,12 @@ const log = (entry: unknown) =>
 // ════════════════════════════════════════════════════════════════════
 function safePath(p: string): string {
   const resolved = path.resolve(WORKDIR, p);
-  if (!resolved.startsWith(WORKDIR + path.sep) && resolved !== WORKDIR) {
-    throw new Error(`작업 디렉토리 밖입니다: ${p}`);
+  const withinWorkdir = resolved === WORKDIR || resolved.startsWith(WORKDIR + path.sep);
+  // ⑱ 자동 메모리 디렉토리도 허용 — 문서: "Claude는 세션 중에 메모리 파일을 읽고 씁니다."
+  //   실제 Claude Code처럼 Read/Write/Edit이 작업 디렉토리 밖의 이 폴더에도 닿을 수 있어야 한다.
+  const withinMemoryDir = resolved === AUTO_MEMORY_DIR || resolved.startsWith(AUTO_MEMORY_DIR + path.sep);
+  if (!withinWorkdir && !withinMemoryDir) {
+    throw new Error(`작업 디렉토리(또는 자동 메모리 디렉토리 ${AUTO_MEMORY_DIR}) 밖입니다: ${p}`);
   }
   return resolved;
 }
@@ -369,8 +386,20 @@ async function runTool(name: string, input: any, depth: number): Promise<string>
   }
 
   switch (name) {
-    case "Read":
-      return fs.readFileSync(safePath(input.file_path), "utf8");
+    // ⑰ 하위 디렉토리 CLAUDE.md / 경로별 규칙(paths frontmatter)은 시작 시 로드되지
+    //   않는다 — 문서: "Claude가 해당 디렉토리의 파일을 읽을 때 필요에 따라 로드됩니다."
+    //   그래서 Read가 실제로 이 파일을 건드리는 "지금 이 순간"에 찾아서, 본문 앞에
+    //   덧붙여 tool_result로 반환한다(스킬 본문이 Skill 도구 호출 시점에 messages로
+    //   들어가는 것과 같은 자리 — systemPrompt가 아니라 대화 계층에 박힌다).
+    case "Read": {
+      const target = safePath(input.file_path);
+      const content = fs.readFileSync(target, "utf8");
+      const lazyBlocks = [...collectSubdirClaudeMdBlocks(target), ...collectPathScopedRuleBlocks(target)];
+      if (lazyBlocks.length > 0) {
+        console.log(`   [memory] ${input.file_path} 읽음 — 지연 로드 블록 ${lazyBlocks.length}개 주입`);
+      }
+      return lazyBlocks.length > 0 ? `${lazyBlocks.join("\n\n")}\n\n${content}` : content;
+    }
 
     case "Write": {
       const target = safePath(input.file_path);
@@ -640,14 +669,24 @@ async function buildInvokedSkillsBlock(): Promise<string | null> {
 }
 
 async function rebuildSystemPromptAfterCompact(currentSystemPrompt: string): Promise<string> {
-  // skillCatalogBlock(설명 목록)을 통째로 제거 — 압축 후엔 이게 다시 안 들어간다.
-  const withoutCatalog = currentSystemPrompt
-    .replace(skillCatalogBlock, "")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+  // ⑳ 압축 후 재로드 — 문서: "프로젝트 루트 CLAUDE.md는 압축을 완전히 생존합니다:
+  //   /compact 후 Claude는 디스크에서 CLAUDE.md를 다시 읽고 세션에 새로 다시 주입합니다."
+  //   예전엔 이전 systemPrompt 문자열을 문자열 치환으로 땜질했지만, 그러면 세션 중
+  //   CLAUDE.md/규칙/MEMORY.md가 바뀌어도 절대 반영이 안 된다 — 그래서 처음부터 다시
+  //   짓는다: 스킬 설명 목록만 "재주입된 스킬 본문"으로 바뀌고, 나머지(CLAUDE.md 계층·
+  //   자동 메모리·규칙)는 매번 디스크에서 새로 읽는 composeSystemPrompt를 그대로 재사용한다.
+  //
+  //   하위 디렉토리 CLAUDE.md / 경로별 규칙(paths)은 반대다 — 문서: "하위 디렉토리의
+  //   중첩된 CLAUDE.md 파일은 자동으로 다시 주입되지 않습니다. 해당 하위 디렉토리의
+  //   파일을 다시 읽을 때 다음에 다시 로드됩니다." 압축이 그 파일들을 "잊게" 만드는
+  //   것을 지연 주입 기록 초기화로 흉내낸다 — 다음에 같은 파일을 Read하면 다시 주입된다.
+  clearLazyMemoryInjections();
 
   const invokedBlock = await buildInvokedSkillsBlock();
-  const rebuilt = invokedBlock ? `${withoutCatalog}\n\n${invokedBlock}` : withoutCatalog;
+  const rebuilt = await composeSystemPrompt({
+    verbose: false,
+    skillsBlock: { kind: "reinjected", block: invokedBlock },
+  });
 
   const [before, after] = await Promise.all([
     client.messages.countTokens({
@@ -782,6 +821,402 @@ async function runLoop(
 }
 
 // ════════════════════════════════════════════════════════════════════
+// ⑯ CLAUDE.md 계층 — 문서 순서 그대로: 관리 정책 → 사용자 → 프로젝트
+//    (디렉토리 트리를 루트→cwd 순으로 순회, 각 단계에서 CLAUDE.md 다음
+//    CLAUDE.local.md) → 하위 디렉토리(⑰에서 지연 로드). 모든 파일은
+//    @import 확장(최대 4홉, 코드펜스/코드스팬은 건너뜀) → HTML 주석 제거
+//    순으로 가공된 뒤에야 컨텍스트에 들어간다. claudeMdExcludes로 특정
+//    경로를 건너뛸 수 있지만 관리 정책만은 예외 없이 항상 로드된다.
+// ════════════════════════════════════════════════════════════════════
+const HOME = os.homedir();
+
+function detectManagedPolicyPath(): string {
+  switch (process.platform) {
+    case "darwin":
+      return "/Library/Application Support/ClaudeCode/CLAUDE.md";
+    case "win32":
+      return "C:\\Program Files\\ClaudeCode\\CLAUDE.md";
+    default:
+      return "/etc/claude-code/CLAUDE.md"; // linux / wsl
+  }
+}
+
+// 작업 디렉토리에서 파일 시스템 루트까지 올라가며 지나친 모든 디렉토리를
+// 루트→cwd 순서로 반환한다. 문서: "Claude를 시작한 위치에 더 가까운
+// 지침이 마지막에 읽힙니다" — 그래서 순서가 곧 "누가 이긴다"를 의미한다.
+function collectDirectoryChain(startDir: string): string[] {
+  const chain: string[] = [];
+  let current = startDir;
+  while (true) {
+    chain.push(current);
+    const parent = path.dirname(current);
+    if (parent === current) break; // 파일 시스템 루트 도달
+    current = parent;
+  }
+  return chain.reverse();
+}
+
+// ── claudeMdExcludes ───────────────────────────────────────────────
+const CLAUDE_MD_EXCLUDES = (process.env.CLAUDE_MD_EXCLUDES ?? "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+function isExcluded(absPath: string): boolean {
+  if (CLAUDE_MD_EXCLUDES.length === 0) return false;
+  // 문서: "패턴은 glob 구문을 사용하여 절대 파일 경로와 일치합니다."
+  return matchesAnyPath(CLAUDE_MD_EXCLUDES, absPath.split(path.sep).join("/"));
+}
+
+// ── @path/to/import 확장 ───────────────────────────────────────────
+// 코드펜스/코드스팬(백틱)은 먼저 자리표시자로 치환해 가져오기 대상에서
+// 제외한다 — 문서: "`@README`를 작성하면 텍스트가 리터럴로 유지"된다.
+function withCodeSpansMasked(text: string, fn: (masked: string) => string): string {
+  const spans: string[] = [];
+  const masked = text.replace(/```[\s\S]*?```|`[^`\n]*`/g, (m) => {
+    spans.push(m);
+    return `\u0000SPAN${spans.length - 1}\u0000`;
+  });
+  const result = fn(masked);
+  return result.replace(/\u0000SPAN(\d+)\u0000/g, (_, i) => spans[Number(i)]);
+}
+
+function expandImports(text: string, baseDir: string, depth = 0, seen: Set<string> = new Set()): string {
+  if (depth >= 4) return text; // 문서: "최대 4개 홉의 깊이"
+  return withCodeSpansMasked(text, (masked) =>
+    masked.replace(/(^|[\s(])@([\w./~-]+)/g, (match, prefix, rawPath) => {
+      const resolved = rawPath.startsWith("~") ? path.join(HOME, rawPath.slice(1)) : path.resolve(baseDir, rawPath);
+      if (!fs.existsSync(resolved) || fs.statSync(resolved).isDirectory() || seen.has(resolved)) return match;
+      const nextSeen = new Set(seen);
+      nextSeen.add(resolved);
+      const content = fs.readFileSync(resolved, "utf8");
+      return prefix + expandImports(content, path.dirname(resolved), depth + 1, nextSeen);
+    }),
+  );
+}
+
+// ── HTML 주석 제거 ─────────────────────────────────────────────────
+// 문서: "CLAUDE.md 파일의 블록 수준 HTML 주석은 콘텐츠가 Claude의
+// 컨텍스트에 주입되기 전에 제거됩니다. ... 코드 블록 내의 주석은 보존됩니다."
+function stripHtmlComments(text: string): string {
+  const fences: string[] = [];
+  const masked = text.replace(/```[\s\S]*?```/g, (m) => {
+    fences.push(m);
+    return `\u0000FENCE${fences.length - 1}\u0000`;
+  });
+  const stripped = masked.replace(/<!--[\s\S]*?-->/g, "");
+  return stripped.replace(/\u0000FENCE(\d+)\u0000/g, (_, i) => fences[Number(i)]);
+}
+
+function processClaudeMdText(raw: string, filePath: string): string {
+  return stripHtmlComments(expandImports(raw, path.dirname(filePath)));
+}
+
+// ════════════════════════════════════════════════════════════════════
+// glob 매칭 — .claude/rules/ 의 paths frontmatter, claudeMdExcludes가
+// 공유해서 쓴다. `{a,b}` 중괄호 확장, `**`/`*`/`?`, `[...]` 괄호 표현식을
+// 지원한다. 문서 규칙: 짝이 안 맞는 `[`가 있는 패턴은 "무효 패턴"으로
+// 취급해 아무것도 매칭시키지 않고, 나머지 패턴은 정상 동작해야 한다.
+// ════════════════════════════════════════════════════════════════════
+function expandBraces(pattern: string): string[] {
+  const m = pattern.match(/^(.*)\{([^{}]+)\}(.*)$/);
+  if (!m) return [pattern];
+  const [, pre, options, post] = m;
+  return options.split(",").flatMap((opt) => expandBraces(pre + opt + post));
+}
+
+function globToRegExp(pattern: string): RegExp | null {
+  let depth = 0;
+  for (const ch of pattern) {
+    if (ch === "[") depth++;
+    if (ch === "]") depth = Math.max(0, depth - 1);
+  }
+  if (depth > 0) return null; // 짝 안 맞는 '[' → 무효 패턴 (문서 규칙)
+
+  let re = "";
+  for (let i = 0; i < pattern.length; i++) {
+    const c = pattern[i];
+    if (c === "*" && pattern[i + 1] === "*") {
+      i++;
+      if (pattern[i + 1] === "/") i++;
+      re += "(?:.*/)?";
+    } else if (c === "*") {
+      re += "[^/]*";
+    } else if (c === "?") {
+      re += "[^/]";
+    } else if (c === ".") {
+      re += "\\.";
+    } else if (c === "[") {
+      let j = i + 1;
+      let cls = "[";
+      if (pattern[j] === "!") {
+        cls += "^";
+        j++;
+      }
+      while (j < pattern.length && pattern[j] !== "]") {
+        cls += pattern[j];
+        j++;
+      }
+      cls += "]";
+      re += cls;
+      i = j;
+    } else if ("+()^$|\\".includes(c)) {
+      re += "\\" + c;
+    } else {
+      re += c;
+    }
+  }
+  return new RegExp(`^${re}$`);
+}
+
+function matchesAnyPath(patterns: string[], relOrAbsPosixPath: string): boolean {
+  return patterns.some((raw) =>
+    expandBraces(raw).some((p) => {
+      const re = globToRegExp(p);
+      return re !== null && re.test(relOrAbsPosixPath);
+    }),
+  );
+}
+
+// ════════════════════════════════════════════════════════════════════
+// ⑰ .claude/rules/ — 심볼릭 링크(및 순환 링크)를 안전하게 따라가며 재귀
+//    적으로 .md 파일을 찾는다. paths frontmatter가 없으면 무조건 로드
+//    (project CLAUDE.md와 동일 우선순위), 있으면 그 패턴과 일치하는
+//    파일을 Read할 때만 지연 로드된다.
+// ════════════════════════════════════════════════════════════════════
+type RuleFile = { filePath: string; scope: "user" | "project"; paths: string[] | null; body: string };
+
+function discoverMarkdownFilesRecursive(dir: string, visitedRealDirs: Set<string> = new Set()): string[] {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const results: string[] = [];
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    let stat: fs.Stats;
+    let real: string;
+    try {
+      stat = fs.statSync(full); // 심볼릭 링크는 대상을 따라간다
+      real = fs.realpathSync(full);
+    } catch {
+      continue; // 깨진 링크 등은 조용히 무시
+    }
+    if (stat.isDirectory()) {
+      if (visitedRealDirs.has(real)) continue; // 순환 심볼릭 링크 방지 — 문서: "우아하게 처리"
+      results.push(...discoverMarkdownFilesRecursive(full, new Set(visitedRealDirs).add(real)));
+    } else if (stat.isFile() && full.endsWith(".md")) {
+      results.push(full);
+    }
+  }
+  return results;
+}
+
+function parseRuleFrontmatter(raw: string): { paths: string[] | null; body: string } {
+  const m = raw.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
+  if (!m) return { paths: null, body: raw };
+  const [, frontmatter, rest] = m;
+  const pathsBlock = frontmatter.match(/^paths:\s*\n((?:[ \t]*-.*\n?)+)/m);
+  if (!pathsBlock) return { paths: null, body: rest };
+  const paths = pathsBlock[1]
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.startsWith("-"))
+    .map((l) =>
+      l
+        .replace(/^-\s*/, "")
+        .trim()
+        .replace(/^["']|["']$/g, ""),
+    );
+  return { paths: paths.length ? paths : null, body: rest };
+}
+
+function discoverRuleFiles(rulesDir: string, scope: "user" | "project"): RuleFile[] {
+  if (!fs.existsSync(rulesDir)) return [];
+  return discoverMarkdownFilesRecursive(rulesDir).map((filePath) => {
+    const { paths, body } = parseRuleFrontmatter(fs.readFileSync(filePath, "utf8"));
+    return { filePath, scope, paths, body };
+  });
+}
+
+const allRuleFiles: RuleFile[] = [
+  ...discoverRuleFiles(path.join(HOME, ".claude", "rules"), "user"),
+  ...discoverRuleFiles(path.join(WORKDIR, ".claude", "rules"), "project"),
+];
+
+// 이미 (시작 시 or 지연 로드로) 컨텍스트에 실린 파일 — 경로별 규칙/하위
+// 디렉토리 CLAUDE.md 중복 주입 방지용. ⑳ 압축 시 이 중 "지연 로드분"만
+// 초기화되어 다음 Read에서 다시 주입되게 한다(무조건 로드분은 매번
+// composeSystemPrompt가 다시 계산하므로 여기 남아있어도 무해하다).
+const injectedLazyBlocks = new Set<string>();
+// /memory 명령이 보여줄 "이번 빌드에서 로드된 CLAUDE.md 계열 파일" 목록
+let loadedClaudeMdFiles: Array<{ scope: string; filePath: string }> = [];
+
+function collectSubdirClaudeMdBlocks(targetAbsPath: string): string[] {
+  const targetDir = path.dirname(targetAbsPath);
+  const relFromWorkdir = path.relative(WORKDIR, targetDir);
+  if (relFromWorkdir.startsWith("..") || path.isAbsolute(relFromWorkdir)) return []; // 작업 디렉토리 밖
+  const segments = relFromWorkdir === "" ? [] : relFromWorkdir.split(path.sep);
+  const blocks: string[] = [];
+  let dir = WORKDIR;
+  for (const seg of segments) {
+    dir = path.join(dir, seg);
+    for (const candidate of [path.join(dir, "CLAUDE.md"), path.join(dir, ".claude", "CLAUDE.md")]) {
+      if (fs.existsSync(candidate) && !injectedLazyBlocks.has(candidate) && !isExcluded(candidate)) {
+        injectedLazyBlocks.add(candidate);
+        loadedClaudeMdFiles.push({ scope: "하위 디렉토리", filePath: candidate });
+        blocks.push(
+          `<subdirectory_claude_md source="${candidate}">\n${processClaudeMdText(fs.readFileSync(candidate, "utf8"), candidate)}\n</subdirectory_claude_md>`,
+        );
+      }
+    }
+    const localCandidate = path.join(dir, "CLAUDE.local.md");
+    if (fs.existsSync(localCandidate) && !injectedLazyBlocks.has(localCandidate) && !isExcluded(localCandidate)) {
+      injectedLazyBlocks.add(localCandidate);
+      loadedClaudeMdFiles.push({ scope: "하위 디렉토리(로컬)", filePath: localCandidate });
+      blocks.push(
+        `<subdirectory_claude_md source="${localCandidate}">\n${processClaudeMdText(fs.readFileSync(localCandidate, "utf8"), localCandidate)}\n</subdirectory_claude_md>`,
+      );
+    }
+  }
+  return blocks;
+}
+
+function collectPathScopedRuleBlocks(targetAbsPath: string): string[] {
+  const relFromWorkdir = path.relative(WORKDIR, targetAbsPath);
+  if (relFromWorkdir.startsWith("..") || path.isAbsolute(relFromWorkdir)) return [];
+  const relPosix = relFromWorkdir.split(path.sep).join("/");
+  const blocks: string[] = [];
+  for (const rule of allRuleFiles) {
+    if (!rule.paths) continue; // paths 없는 규칙은 시작 시 이미 무조건 로드됨
+    if (injectedLazyBlocks.has(rule.filePath) || isExcluded(rule.filePath)) continue;
+    if (matchesAnyPath(rule.paths, relPosix)) {
+      injectedLazyBlocks.add(rule.filePath);
+      blocks.push(
+        `<rule scope="${rule.scope}" source="${rule.filePath}" paths="${rule.paths.join(", ")}">\n` +
+          `${processClaudeMdText(rule.body, rule.filePath)}\n</rule>`,
+      );
+    }
+  }
+  return blocks;
+}
+
+function clearLazyMemoryInjections() {
+  injectedLazyBlocks.clear();
+}
+
+// 관리 정책 → 사용자 → 프로젝트(디렉토리 트리, 루트→cwd) + 로컬 → 무조건
+// 로드 규칙. /compact 후에도, 첫 시작 때도 이 함수 하나로 매번 디스크에서
+// 다시 읽는다 — 그래야 세션 중 파일이 바뀌어도 재반영된다.
+function buildStartupClaudeMdBlocks(): { managed: string | null; user: string | null; project: string | null; rules: string | null } {
+  loadedClaudeMdFiles = [];
+
+  const managedPath = detectManagedPolicyPath();
+  const managed = fs.existsSync(managedPath) // claudeMdExcludes로도 제외 불가 — 문서 규칙
+    ? (() => {
+        loadedClaudeMdFiles.push({ scope: "관리 정책", filePath: managedPath });
+        return `<managed_policy_claude_md source="${managedPath}">\n${processClaudeMdText(fs.readFileSync(managedPath, "utf8"), managedPath)}\n</managed_policy_claude_md>`;
+      })()
+    : null;
+
+  const userPath = path.join(HOME, ".claude", "CLAUDE.md");
+  const user =
+    fs.existsSync(userPath) && !isExcluded(userPath)
+      ? (() => {
+          loadedClaudeMdFiles.push({ scope: "사용자", filePath: userPath });
+          return `<user_claude_md source="${userPath}">\n${processClaudeMdText(fs.readFileSync(userPath, "utf8"), userPath)}\n</user_claude_md>`;
+        })()
+      : null;
+
+  const projectParts: string[] = [];
+  for (const dir of collectDirectoryChain(WORKDIR)) {
+    for (const candidate of [path.join(dir, "CLAUDE.md"), path.join(dir, ".claude", "CLAUDE.md")]) {
+      if (fs.existsSync(candidate) && !isExcluded(candidate)) {
+        loadedClaudeMdFiles.push({ scope: dir === WORKDIR ? "프로젝트" : "상위 디렉토리", filePath: candidate });
+        projectParts.push(
+          `<project_claude_md source="${candidate}">\n${processClaudeMdText(fs.readFileSync(candidate, "utf8"), candidate)}\n</project_claude_md>`,
+        );
+      }
+    }
+    const localCandidate = path.join(dir, "CLAUDE.local.md");
+    if (fs.existsSync(localCandidate) && !isExcluded(localCandidate)) {
+      loadedClaudeMdFiles.push({ scope: "로컬", filePath: localCandidate });
+      projectParts.push(
+        `<local_claude_md source="${localCandidate}">\n${processClaudeMdText(fs.readFileSync(localCandidate, "utf8"), localCandidate)}\n</local_claude_md>`,
+      );
+    }
+  }
+
+  const unconditional = allRuleFiles.filter((r) => r.paths === null && !isExcluded(r.filePath));
+  const rules = unconditional.length
+    ? unconditional
+        .map((r) => {
+          injectedLazyBlocks.add(r.filePath); // 시작 시 이미 실렸으니 지연 로드 대상에서 제외
+          return `<rule scope="${r.scope}" source="${r.filePath}">\n${processClaudeMdText(r.body, r.filePath)}\n</rule>`;
+        })
+        .join("\n\n")
+    : null;
+
+  return { managed, user, project: projectParts.length ? projectParts.join("\n\n") : null, rules };
+}
+
+// ════════════════════════════════════════════════════════════════════
+// ⑱ 자동 메모리 저장 위치 — 문서: "~/.claude/projects/<project>/memory/,
+//    <project> 경로는 git 저장소에서 파생". 실제 관찰된 슬러그 규칙은
+//    절대 경로의 구분자를 "-"로 치환하는 것이다(이 세션의 스크래치패드
+//    디렉토리 이름 자체가 그 증거: .../-Users-...-claude-code-study/...).
+//    ★ 단, 진짜 `~/.claude/projects/`는 실제 Claude Code CLI가 이 저장소를
+//    위해 쓰고 있는 바로 그 자리라서(이 대화 자체가 거기 memory/를 쓴다),
+//    미니 데모가 거기 같이 쓰고 읽으면 데모 메모리와 실제 세션 메모리가
+//    섞인다. 그래서 같은 슬러그 규칙·같은 "projects/<slug>/memory" 모양을
+//    그대로 재현하되, 루트만 별도 샌드박스(~/.mini-claude-code/)로 둔다.
+// ════════════════════════════════════════════════════════════════════
+const MINI_CLAUDE_HOME = path.join(HOME, ".mini-claude-code");
+
+function findGitRepoRoot(startDir: string): string | null {
+  try {
+    return execSync("git rev-parse --show-toplevel", { cwd: startDir, encoding: "utf8" }).trim();
+  } catch {
+    return null;
+  }
+}
+
+function projectSlug(absPath: string): string {
+  return absPath.replace(/[\\/]/g, "-");
+}
+
+function resolveAutoMemoryDirectory(): string {
+  if (process.env.AUTO_MEMORY_DIRECTORY) {
+    const raw = process.env.AUTO_MEMORY_DIRECTORY;
+    return raw.startsWith("~") ? path.join(HOME, raw.slice(1)) : path.resolve(raw);
+  }
+  // 문서: "동일한 저장소 내의 모든 worktree 및 하위 디렉토리는 하나의
+  // 자동 메모리 디렉토리를 공유합니다" — git 저장소 루트를 기준으로 삼는다.
+  const projectRoot = findGitRepoRoot(WORKDIR) ?? WORKDIR;
+  return path.join(MINI_CLAUDE_HOME, "projects", projectSlug(projectRoot), "memory");
+}
+
+const AUTO_MEMORY_DIR = resolveAutoMemoryDirectory();
+const MEMORY_INDEX_PATH = path.join(AUTO_MEMORY_DIR, "MEMORY.md");
+// 문서: "autoMemoryEnabled" 설정 / CLAUDE_CODE_DISABLE_AUTO_MEMORY 환경변수
+const AUTO_MEMORY_ENABLED = process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY !== "1";
+
+// 이 저장소에 이미 있던 (구) WORKDIR/MEMORY.md — 이 프로젝트 자신의
+// 개발 노트이자, 리팩터 전까지는 실제 auto-memory 파일이기도 했다.
+// 새 위치가 비어 있으면 1회 복사해서 데모가 끊기지 않게 한다(원본은 보존).
+function bootstrapAutoMemoryDir() {
+  fs.mkdirSync(AUTO_MEMORY_DIR, { recursive: true });
+  const legacyPath = path.join(WORKDIR, "MEMORY.md");
+  if (!fs.existsSync(MEMORY_INDEX_PATH) && fs.existsSync(legacyPath)) {
+    fs.copyFileSync(legacyPath, MEMORY_INDEX_PATH);
+    console.log(`   [memory] ${legacyPath} → ${MEMORY_INDEX_PATH} 로 초기 마이그레이션(복사)`);
+  }
+}
+bootstrapAutoMemoryDir();
+
+// ════════════════════════════════════════════════════════════════════
 // ⑩ 컨텍스트 윈도우 초기 로드 — 사용자가 한 글자도 치기 전에 시스템
 //    프롬프트에 쌓이는 계층들. context-window 문서의 "Before you type
 //    anything" 타임라인을 순서 그대로 조립하고, 각 블록이 실제로 몇
@@ -789,21 +1224,21 @@ async function runLoop(
 //
 //      시스템 프롬프트 → 도구 정의(built-in) → Auto memory(MEMORY.md) → 환경 정보
 //      → MCP 도구(⑪ 모드에 따라 스키마 전체 또는 ToolSearch 메타 도구만)
-//      → Skill 설명 → 전역 CLAUDE.md → 프로젝트 CLAUDE.md
+//      → Skill 설명 → 관리 정책 CLAUDE.md → 사용자 CLAUDE.md
+//      → 프로젝트/로컬 CLAUDE.md(⑯, 디렉토리 트리) → 무조건 로드 규칙(⑰)
 //      (+ 문서에 따르면 git 브랜치/status/최근 커밋은 시스템 프롬프트 "맨 끝"에
 //        별도 블록으로 더 붙는다 — 그래서 여기서도 마지막에 하나 더 추가)
 // ════════════════════════════════════════════════════════════════════
-function loadFileBlock(filePath: string, tag: string): string | null {
-  if (!fs.existsSync(filePath)) return null;
-  return `<${tag}>\n${fs.readFileSync(filePath, "utf8")}\n</${tag}>`;
-}
-
 function loadAutoMemory(): string | null {
-  const memPath = path.join(WORKDIR, "MEMORY.md");
-  if (!fs.existsSync(memPath)) return null;
+  if (!AUTO_MEMORY_ENABLED) return null;
+  if (!fs.existsSync(MEMORY_INDEX_PATH)) return null;
   // 문서 규칙: 최초 200줄 또는 25KB 중 먼저 도달하는 지점까지만 로드한다
-  const capped = fs.readFileSync(memPath, "utf8").slice(0, 25_000).split("\n").slice(0, 200).join("\n");
-  return `<auto_memory>\n${capped}\n</auto_memory>`;
+  const capped = fs.readFileSync(MEMORY_INDEX_PATH, "utf8").slice(0, 25_000).split("\n").slice(0, 200).join("\n");
+  return (
+    `<auto_memory source="${MEMORY_INDEX_PATH}" dir="${AUTO_MEMORY_DIR}">\n${capped}\n</auto_memory>\n` +
+    `<auto_memory_note>이 디렉토리는 Read/Write/Edit로 직접 접근할 수 있습니다. ` +
+    `MEMORY.md는 인덱스일 뿐이고, 나머지 주제별 파일은 필요할 때만 Read하세요.</auto_memory_note>`
+  );
 }
 
 function buildEnvironmentInfo(): string {
@@ -842,11 +1277,16 @@ type StartupSection = {
   toolsAdd?: Anthropic.Tool[]; // tools 배열에 스키마로 누적되는 부분
 };
 
-async function buildSystemPromptWithBreakdown(): Promise<string> {
-  // ★ system 텍스트와 tools(도구 스키마)는 API 요청에서 서로 다른 필드다.
-  //   둘 다 컨텍스트를 차지하지만, 원인을 구분하려면 회계도 따로 해야 한다.
-  //   (이전 버전은 tools를 매 호출마다 고정으로 끼워 넣어서, 그 고정비가
-  //    전부 맨 처음 측정되는 섹션 — "시스템 프롬프트" — 로 잘못 잡혔었다.)
+// 시작 시 1회, 그리고 ⑳ 압축 후 재구성 시 다시 — 이 함수 하나로 두 경로를 통일한다.
+// 차이는 opts뿐이다: verbose(레이어별 토큰 로그 출력 여부)와 skillsBlock(설명 목록
+// vs 압축 후 재주입된 스킬 본문). CLAUDE.md/규칙/자동 메모리는 매번 buildStartupClaudeMdBlocks·
+// loadAutoMemory를 새로 호출하므로 항상 "지금 디스크에 있는 내용"을 반영한다.
+async function composeSystemPrompt(opts: {
+  verbose: boolean;
+  skillsBlock: { kind: "catalog" } | { kind: "reinjected"; block: string | null };
+}): Promise<string> {
+  const claudeMd = buildStartupClaudeMdBlocks();
+
   const sections: StartupSection[] = [
     { label: "시스템 프롬프트 (지시문)", system: SYSTEM_BASE },
     { label: "도구 정의 (built-in 7개 스키마)", toolsAdd: builtinTools },
@@ -861,14 +1301,20 @@ async function buildSystemPromptWithBreakdown(): Promise<string> {
       label: mcpEagerLoaded ? "MCP 도구 스키마 (즉시 로드됨)" : "ToolSearch 메타 도구 (MCP 이름조차 노출 안 함)",
       toolsAdd: mcpEagerLoaded ? mcpTools : activeTools.filter((t) => t.name === "ToolSearch"),
     },
-    { label: "Skill 설명", system: skillCatalogBlock },
-    { label: "전역 CLAUDE.md", system: loadFileBlock(path.join(os.homedir(), ".claude", "CLAUDE.md"), "global_claude_md") },
-    { label: "프로젝트 CLAUDE.md", system: loadFileBlock(path.join(WORKDIR, "CLAUDE.md"), "project_claude_md") },
+    opts.skillsBlock.kind === "catalog"
+      ? { label: "Skill 설명", system: skillCatalogBlock }
+      : { label: "재주입된 skill 본문 (압축 후, ⑫)", system: opts.skillsBlock.block },
+    { label: "관리 정책 CLAUDE.md (⑯)", system: claudeMd.managed },
+    { label: "사용자 CLAUDE.md (⑯)", system: claudeMd.user },
+    { label: "프로젝트/로컬 CLAUDE.md (⑯, 디렉토리 트리)", system: claudeMd.project },
+    { label: "무조건 로드 규칙 (⑰ .claude/rules/)", system: claudeMd.rules },
     { label: "Git 상태 (맨 끝 블록)", system: buildGitStatusBlock() },
   ];
 
-  console.log("\n📦 세션 시작 전 로드되는 컨텍스트 (countTokens API로 실측)");
-  console.log("─".repeat(62));
+  if (opts.verbose) {
+    console.log("\n📦 세션 시작 전 로드되는 컨텍스트 (countTokens API로 실측)");
+    console.log("─".repeat(62));
+  }
 
   let cumulativeSystem = "";
   let cumulativeTools: Anthropic.Tool[] = [];
@@ -877,27 +1323,67 @@ async function buildSystemPromptWithBreakdown(): Promise<string> {
     const hasSystem = !!s.system;
     const hasTools = !!s.toolsAdd && s.toolsAdd.length > 0;
     if (!hasSystem && !hasTools) {
-      console.log(`  ${s.label.padEnd(30)}  (없음 — 스킵)`);
+      if (opts.verbose) console.log(`  ${s.label.padEnd(30)}  (없음 — 스킵)`);
       continue;
     }
     if (hasSystem) cumulativeSystem += (cumulativeSystem ? "\n\n" : "") + s.system;
     if (hasTools) cumulativeTools = [...cumulativeTools, ...s.toolsAdd!];
 
-    const counted = await client.messages.countTokens({
-      model: MODEL,
-      system: cumulativeSystem || undefined,
-      tools: cumulativeTools.length ? cumulativeTools : undefined,
-      messages: [{ role: "user", content: "." }],
-    });
-    const marginal = counted.input_tokens - prevTokens;
-    prevTokens = counted.input_tokens;
-    console.log(`  ${s.label.padEnd(30)} +${String(marginal).padStart(5)} tokens`);
+    if (opts.verbose) {
+      const counted = await client.messages.countTokens({
+        model: MODEL,
+        system: cumulativeSystem || undefined,
+        tools: cumulativeTools.length ? cumulativeTools : undefined,
+        messages: [{ role: "user", content: "." }],
+      });
+      const marginal = counted.input_tokens - prevTokens;
+      prevTokens = counted.input_tokens;
+      console.log(`  ${s.label.padEnd(30)} +${String(marginal).padStart(5)} tokens`);
+    }
   }
 
-  console.log("─".repeat(62));
-  console.log(`  ${"합계 (첫 프롬프트 이전)".padEnd(30)} ${String(prevTokens).padStart(6)} tokens\n`);
+  if (opts.verbose) {
+    console.log("─".repeat(62));
+    console.log(`  ${"합계 (첫 프롬프트 이전)".padEnd(30)} ${String(prevTokens).padStart(6)} tokens\n`);
+  }
 
   return cumulativeSystem;
+}
+
+async function buildSystemPromptWithBreakdown(): Promise<string> {
+  return composeSystemPrompt({ verbose: true, skillsBlock: { kind: "catalog" } });
+}
+
+// ⑲ /memory — 실제 명령처럼 API 호출 없이 "지금 로드된 파일"만 즉시 나열한다.
+//   buildStartupClaudeMdBlocks()가 이미 loadedClaudeMdFiles를 채워두므로, 이 함수는
+//   composeSystemPrompt(즉 buildSystemPromptWithBreakdown)가 최소 한 번 실행된 뒤 호출해야 한다.
+function printMemoryCommand() {
+  console.log("\n📋 /memory — 현재 세션에 로드된 파일\n");
+
+  console.log("CLAUDE.md 계열:");
+  if (loadedClaudeMdFiles.length === 0) console.log("  (없음)");
+  for (const f of loadedClaudeMdFiles) console.log(`  [${f.scope}] ${f.filePath}`);
+
+  console.log("\n규칙 (.claude/rules/):");
+  if (allRuleFiles.length === 0) console.log("  (없음)");
+  for (const r of allRuleFiles) {
+    const status =
+      r.paths === null
+        ? "무조건 로드"
+        : injectedLazyBlocks.has(r.filePath)
+          ? "조건부 로드됨 (이번 세션에서 이미 매칭된 파일을 읽음)"
+          : `대기 중 (paths: ${r.paths.join(", ")})`;
+    console.log(`  [${r.scope}] ${r.filePath} — ${status}`);
+  }
+
+  console.log(`\n자동 메모리`);
+  console.log(`  활성화: ${AUTO_MEMORY_ENABLED ? "예" : "아니오 (CLAUDE_CODE_DISABLE_AUTO_MEMORY=1)"}`);
+  console.log(`  폴더: ${AUTO_MEMORY_DIR}`);
+  console.log(`  MEMORY.md: ${fs.existsSync(MEMORY_INDEX_PATH) ? "있음" : "없음"}`);
+
+  if (CLAUDE_MD_EXCLUDES.length > 0) {
+    console.log(`\nclaudeMdExcludes: ${CLAUDE_MD_EXCLUDES.join(", ")}`);
+  }
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -910,6 +1396,17 @@ process.on("SIGINT", () => {
   interrupted = true;
   console.log("\n⏹  중단 요청됨 — 현재 턴까지만 처리합니다");
 });
+
+// ⑲ /memory — skill이 아니라 하네스 내장 명령이라 API를 한 번도 안 부르고
+//   여기서 바로 끝난다. 로드 상태를 보려면 실제로 한 번 로드해봐야 하므로
+//   buildSystemPromptWithBreakdown()은 그대로 실행한다(그래서 토큰 브레이크다운도 덤으로 나온다).
+if (userPrompt.trim() === "/memory") {
+  await buildSystemPromptWithBreakdown();
+  printMemoryCommand();
+  rl.close();
+  await mcp?.close();
+  process.exit(0);
+}
 
 // ⑬ 슬래시로 직접 호출 — "/이름 ..." 형태면 모델의 판단을 거치지 않고
 //   그 스킬을 즉시 로드한다. disableModelInvocation 스킬을 쓸 수 있는
