@@ -5,3 +5,6 @@
 - 압축(compact)은 입력 토큰이 30,000을 넘으면 발동하며, 최근 2쌍(assistant+user)만 남기고 나머지를 요약 한 덩어리로 교체한다.
 - subagent(Agent 도구)는 depth 1까지만 허용된다 — 중첩 호출은 에러.
 - MCP 도구 스키마는 기본적으로 지연 로드된다. `USE_MCP=1`만 주면 이름만 노출되고, 모델이 `ToolSearch`로 찾아야 실제 스키마가 로드된다. `ENABLE_TOOL_SEARCH=false`로 즉시 전부 로드, `ENABLE_TOOL_SEARCH=auto`로 10% 임계값 자동 판단.
+- 자동 메모리(MEMORY.md)는 더 이상 `WORKDIR/MEMORY.md`가 아니라 `~/.mini-claude-code/projects/<git루트 슬러그>/memory/MEMORY.md`에서 읽고 쓴다(이 파일은 최초 1회 그쪽으로 복사되고 원본은 그대로 남음). 실제 `~/.claude/projects/`는 건드리지 않는다 — 거기는 진짜 Claude Code CLI가 이 저장소용으로 쓰는 자리라서 데모와 섞이면 안 되기 때문. `AUTO_MEMORY_DIRECTORY`로 위치를 바꾸거나 `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`로 끌 수 있다.
+- CLAUDE.md는 관리 정책(OS별 고정 경로) → 사용자(`~/.claude/CLAUDE.md`) → 프로젝트(작업 디렉토리에서 파일 시스템 루트까지 디렉토리 트리 순회, 루트가 먼저) → 로컬(`CLAUDE.local.md`) 순으로 로드되고, `.claude/rules/`의 `paths` frontmatter가 없는 규칙만 이 시점에 같이 로드된다. `paths`가 있는 규칙과 하위 디렉토리 CLAUDE.md는 그 파일을 Read할 때 지연 주입되며, `/compact` 후에는 지연 주입 기록이 초기화되어 다시 읽을 때 재주입된다. `CLAUDE_MD_EXCLUDES`(쉼표 구분 glob, 절대경로 매칭)로 특정 파일을 건너뛸 수 있지만 관리 정책만은 예외 없이 항상 로드된다.
+- `npm run mini -- "/memory"`는 API를 호출하지 않고 지금 로드된 CLAUDE.md/규칙/자동 메모리 파일 목록만 출력하고 끝난다.
